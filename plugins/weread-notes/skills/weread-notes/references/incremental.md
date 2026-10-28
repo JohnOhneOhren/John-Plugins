@@ -20,7 +20,7 @@
 }
 ```
 
-章节尚无导出标题的旧手工笔记，不要猜测归属，应先确认与原文对应的章节。有未关联原文的独立章节想法，selection 为空字符串。评论选区需要由 discussion 标记/实际 block 对应关系恢复完整原文；只有截短片段无法可靠对应时应说明，不能凭相似度绑定。只有完整读取成功才设置 body_complete/comments_complete=true。接口不给 block ID 时省略 id，不编造 ID。blank_after 记录后面是否已有真实空段落 `<p />`，Markdown 两个换行只是段落分隔，不算额外空白块。
+章节尚无导出标题的旧手工笔记，不要猜测归属，应先确认与原文对应的章节。有未关联原文的独立章节想法，selection 为空字符串。评论选区需要由 discussion 标记/实际 block 对应关系恢复完整原文；只有截短片段无法可靠对应时应说明，不能凭相似度绑定。只有完整读取成功才设置 body_complete/comments_complete=true。接口不给 block ID 时省略 id，不编造 ID。blank_after 记录后面是否已有真实空段落 `<p />`，Markdown 两个换行只是段落分隔，不算额外空白块。读取旧日期提及时，按底层 start 的 ISO 数字日期转成纯文本参与对比，不能直接剥掉日期标签造成日期缺失；后续写入始终使用数字文本，不创建新的日期提及。
 
 3. 后台 `sync-plan --plan <当前计划> --existing <快照> --receipt <已有回执，可省略> --output <增量计划>`。回执只能对应同一书、同一实际 page_id：
 

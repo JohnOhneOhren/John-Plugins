@@ -32,6 +32,21 @@ def snapshot():
 
 
 class IncrementalTests(unittest.TestCase):
+    def test_record_dates_are_plain_numeric_text_in_body_and_comments(self):
+        current = book(show_dates=True)
+        plan = bridge.connector_plan(current)
+        self.assertIn('（2026-01-01）', plan['content'])
+        self.assertNotIn('<date ', plan['content'])
+        self.assertNotIn('@May', plan['content'])
+        for comment in plan['comments']:
+            self.assertTrue(all(part['type'] == 'text' for part in comment['rich_text']))
+            self.assertIn('（2026-01-01）', ''.join(p['text']['content'] for p in comment['rich_text']))
+        blocks, comments = core.notion_plan(current)
+        for block in blocks:
+            body = block.get(block['type'], {})
+            self.assertTrue(all(p['type'] == 'text' for p in body.get('rich_text', [])))
+        self.assertTrue(all(p['type'] == 'text' for c in comments for p in c['rich_text']))
+
     def test_only_new_quote_and_comment_are_added(self):
         original = snapshot()
         before = copy.deepcopy(original)
