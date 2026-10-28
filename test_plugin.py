@@ -20,7 +20,7 @@ import updates
 from tools.build_plugin import build, FILES
 
 
-def archive_for(version='0.2.0', extra=None):
+def archive_for(version='0.3.0', extra=None):
     data = io.BytesIO()
     files = {
         'plugin.json': json.dumps({'name': 'weread-notes', 'version': version}).encode(),
@@ -115,7 +115,7 @@ class PluginTests(unittest.TestCase):
     def test_package_version_mismatch_is_not_activated(self):
         with tempfile.TemporaryDirectory() as folder:
             info, data = archive_for()
-            info['version'] = '0.3.0'
+            info['version'] = '0.4.0'
             with self.assertRaises(ValueError):
                 updates.install_release(info, data, Path(folder))
             self.assertFalse((Path(folder) / 'active.json').exists())

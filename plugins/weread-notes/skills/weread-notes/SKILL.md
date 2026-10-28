@@ -5,14 +5,17 @@ description: 从用户微信读书书架选书，导出按章节整理的划线�
 
 通过本插件的 Python 工具访问微信读书。需要本地执行能力、Python 3.10+；没有这些能力时说明限制，不能声称仅凭网页已登录即可抓取。
 
-入口是相对此文件 `../../scripts/launch.py`。先 `python <入口绝对路径> doctor`，缺少依赖时在独立虚拟环境中安装插件根目录 requirements.txt，不改系统 Python。先读取 `../../GUIDE.md` 的授权与更新说明；维护接口时再读 `../../MAINTAINING.md`。
+入口是相对此文件 `../../scripts/launch.py`。使用本地后台命令工具执行，不打开 PowerShell、终端面板或外部窗口，不使用 tty，不调用旧版 weread_notes.py 交互向导。先 `python <入口绝对路径> doctor`，缺少依赖时在用户可写的插件状态目录或工作目录创建独立虚拟环境，后台安装插件根目录 requirements.txt；不修改系统 Python 或只读插件缓存。已有可用解释器则直接使用。先读取 `../../GUIDE.md` 的授权与更新说明；维护接口时再读 `../../MAINTAINING.md`。
 
 ## 交互与授权
 
-1. 微信读书优先使用用户自己的官方 `wrk-` Key。已有 WEREAD_API_KEY 环境变量可直接使用，否则让用户在本地交互终端输入；用 `prepare` 会隐藏输入。不要索取聊天中的 Key、Cookie、Notion Token，不扫描 Edge 凭证库，不把凭证写入包或结果。获取 Key 的官方页面是 https://weread.qq.com/r/weread-skills 。登录 Edge 本身不会向此插件授权。
-2. 已有凭证时可运行 `shelf`，展示返回书架的书名、作者、bookId，按序号或关键词选择；不以笔记概览代替我的书架。没有环境凭证时运行本地 `prepare`，它会在同一次进程内完成授权和书架选择，避免重复输入 Key。
-3. 问 Word 还是 Notion，以及是否显示记录日期。Notion 必须区分：直接写入指定页面正文、在父页下另建子页、数据库新记录、私有新笔记。用户说“导入这个页面”默认指正文；不能自行建立子页。用户明确的选择优先。目标可为名称或 URL；名称须搜索并核对路径，重名再追问。
-4. `prepare --format word|notion --dates show|hide --output <用户输出目录>`；可附 `--book-id <书架 bookId>`，或由本地向导选书。阶段进度写 stderr，stdout 只返回结果 JSON。不要把私密笔记发给第三方诊断服务。
+1. 所有书籍、日期和导出目标的提问只在 Codex 对话中完成。微信读书优先使用用户自己的官方 `wrk-` Key，支持已有 WEREAD_API_KEY 或 Windows DPAPI 加密授权记录。`auth status`/doctor 不读取剪贴板，也不输出 Key。缺少授权时给用户官方页面 https://weread.qq.com/r/weread-skills ，让用户登录、复制 Key、回到对话说“已复制”；同时在对话中问是否记住授权。不要索取聊天中的 Key、Cookie、Notion Token，不扫描 Edge 凭证库。
+2. 仅在用户明确已复制并同意读取后，后台执行 `auth import --clipboard`；若选择记住授权附加 `--remember`，否则授权记录加密缓存 30 分钟。该命令先验证书架再保存，并返回 books，可直接用于接下来的选书，无需重复读取。未经用户这次复制确认不能自动反复读取剪贴板。授权失败在对话中解释并等待用户处理，不能弹出终端。`auth forget` 清除加密记录，现有环境变量授权需另行由用户清除；DPAPI 绑定相同执行用户与电脑，环境切换解密失败时重新授权，不以明文回退。
+3. 已有凭证时后台运行 `shelf`。把真实书架书名、作者展示在对话中，保留 bookId 映射，用户只需选一次序号或关键词。用户已经点名的书能唯一匹配就直接使用；重名在对话中澄清。不得让用户在另一个窗口重复输入书名，不以笔记概览代替书架。
+4. 在对话中问 Word 还是 Notion，以及是否显示记录日期，已经给定的选项不重复问。Notion 必须区分：直接写入指定页面正文、在父页下另建子页、数据库新记录、私有新笔记。用户说“导入这个页面”默认指正文；不能自行建立子页。目标可为名称或 URL；名称须搜索并核对路径，重名再追问。
+5. 在后台执行 `prepare --book-id <已选 bookId> --format word|notion --dates show|hide --output <用户输出目录>`。也支持 `--book-name <关键词>`，但已取得 ID 应使用 ID。命令完全不读 stdin：selection_required 表示应在对话中选书，auth_required 表示应在对话中处理授权。不要把非零返回码当作需要打开终端的理由。stderr 是进度，stdout 是结果 JSON；在对话中转述简洁进度和成功位置。不要把私密笔记发给第三方诊断服务。
+
+如果执行沙箱无法访问 Windows 用户加密保护或剪贴板，使用宿主后台命令工具提供的本机用户权限流程，获准后重试，仍不开窗口。授权、doctor、shelf、prepare 应使用相同用户身份和状态目录；不能在两个身份间反复创建授权。宿主不允许本机权限时如实说明当前环境无法完成授权，不要求用户改回终端选书，也不把 Key 放进参数绕过保护。
 
 ## Notion 对话导入
 

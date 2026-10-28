@@ -11,6 +11,32 @@ import re
 import sys
 from zoneinfo import ZoneInfo
 import weread_notes as core
+import credentials
+
+
+class SelectionError(core.ExportError):
+    def __init__(self, books, message='请在 Codex 对话中选择书籍。'):
+        super().__init__(message)
+        self.books = books
+
+
+def book_choices(books):
+    return [{'bookId': str(b['bookId']), 'title': b.get('title'), 'author': b.get('author')} for b in books]
+
+
+def select_for_chat(books, book_id=None, book_name=None):
+    if book_id:
+        matches = [b for b in books if str(b['bookId']) == book_id]
+    elif book_name and book_name.strip():
+        exact = [b for b in books if str(b.get('title', '')).casefold() == book_name.strip().casefold()]
+        matches = exact or [b for b in books if book_name.strip().casefold() in str(b.get('title', '')).casefold()]
+    else:
+        raise SelectionError(book_choices(books))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SelectionError(book_choices(books), '当前书架中未找到这本书，请在对话中重新选择。')
+    raise SelectionError(book_choices(matches), '匹配到多本书，请在对话中选择具体一本。')
 
 
 def markdown_text(text):
@@ -64,8 +90,18 @@ def main(argv=None):
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('doctor')
     sub.add_parser('shelf')
+    auth = sub.add_parser('auth')
+    auth_sub = auth.add_subparsers(dest='auth_command', required=True)
+    auth_sub.add_parser('status')
+    auth_sub.add_parser('forget')
+    provision = auth_sub.add_parser('import')
+    provision.add_argument('--clipboard', action='store_true', required=True,
+                           help='仅在用户明确已复制 Key 后主动读取一次，不回显')
+    provision.add_argument('--remember', action='store_true', help='同一 Windows 用户加密记住授权；默认仅保留 30 分钟')
     prep = sub.add_parser('prepare')
-    prep.add_argument('--book-id')
+    selection = prep.add_mutually_exclusive_group()
+    selection.add_argument('--book-id')
+    selection.add_argument('--book-name')
     prep.add_argument('--format', choices=['word', 'notion'], required=True)
     prep.add_argument('--dates', choices=['show', 'hide'], required=True)
     prep.add_argument('--output', type=Path, default=Path.cwd() / 'Weread_Notes_Output')
@@ -80,32 +116,37 @@ def main(argv=None):
                 result = {'python': sys.version.split()[0], 'python_supported': sys.version_info >= (3, 10),
                           'dependencies': {m: importlib.util.find_spec(m) is not None for m in ['docx', 'notion_client']},
                           'weread_authorized_in_environment': bool(os.environ.get('WEREAD_API_KEY')),
+                          'auth': credentials.status(), 'interaction': 'codex_chat_only',
                           'edge_required': False, 'notion_connector': '由 Codex 检查当前用户连接'}
+            elif args.command == 'auth':
+                if args.auth_command == 'status':
+                    result = credentials.status()
+                elif args.auth_command == 'forget':
+                    result = credentials.forget()
+                else:
+                    # 不调用 input/getpass/PowerShell，不在 stdout、stderr 或文件中输出 Key。
+                    key = core.read_clipboard().strip()
+                    core.validate_api_key(key)
+                    books = core.Weread(api_key=key, interactive_auth=False).shelf()
+                    credentials.save_key(key, remember=args.remember)
+                    result = {'authorized': True, 'remembered': args.remember,
+                              'expires_in_seconds': None if args.remember else 1800, 'books': book_choices(books)}
             else:
                 if args.command == 'prepare' and min(args.max_review_checks, args.max_review_ranges) < 1:
                     raise core.ExportError('扫描上限必须大于 0。')
                 if args.command == 'prepare' and args.demo:
                     book = core.demo_book(ZoneInfo('Asia/Shanghai'))
                 else:
-                    key = os.environ.get('WEREAD_API_KEY', '')
-                    if not key:
-                        if not sys.stdin.isatty():
-                            raise core.ExportError('请在本地交互终端运行 prepare 输入 Key，或预先设置 WEREAD_API_KEY。')
-                        key = core.secret('请输入微信读书官方 Key：', 'WEREAD_API_KEY', core.validate_api_key)
-                    core.validate_api_key(key)
+                    key = credentials.get_key()
                     client = core.Weread(api_key=key, interactive_auth=False,
                                          personal_only=getattr(args, 'personal_only', False),
                                          max_review_checks=getattr(args, 'max_review_checks', 200),
                                          max_review_ranges=getattr(args, 'max_review_ranges', 500))
                     shelf = client.shelf()
                     if args.command == 'shelf':
-                        result = {'books': [{'bookId': str(b['bookId']), 'title': b.get('title'),
-                                             'author': b.get('author')} for b in shelf]}
+                        result = {'books': book_choices(shelf)}
                     else:
-                        matches = [b for b in shelf if str(b['bookId']) == args.book_id] if args.book_id else []
-                        if args.book_id and len(matches) != 1:
-                            raise core.ExportError('bookId 不在当前书架中，不能导出。')
-                        selected = matches[0] if matches else core.select_book(shelf)
+                        selected = select_for_chat(shelf, args.book_id, args.book_name)
                         client.show_dates = args.dates == 'show'
                         book = client.collect(selected, ZoneInfo('Asia/Shanghai'), 0)
                 if args.command == 'prepare':
@@ -125,6 +166,13 @@ def main(argv=None):
     except (KeyboardInterrupt, EOFError):
         print(json.dumps({'error': '已取消'}, ensure_ascii=False))
         return 130
+    except SelectionError as exc:
+        print(json.dumps({'status': 'selection_required', 'code': 'selection_required',
+                          'message': str(exc), 'books': exc.books}, ensure_ascii=False))
+        return 2
+    except credentials.AuthError as exc:
+        print(json.dumps({'status': 'auth_required', 'code': exc.code, 'message': str(exc)}, ensure_ascii=False))
+        return 3
     except Exception as exc:
         # 仅已知安全的自定义错误可展示；第三方异常可能包含凭证。
         message = str(exc) if isinstance(exc, core.ExportError) else '执行失败：' + type(exc).__name__

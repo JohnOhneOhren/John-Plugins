@@ -2,6 +2,8 @@
 
 核心实现来源是仓库根目录 weread_notes.py，构建时同步到插件，不要分别修改两个副本。bridge.py 输出的 notion-plan schema_version=1，正文与评论分离。已有的单条点赞判断、严格章节关联、日期选择与精简版式均保留。
 
+0.2.0 默认交互为 Codex 对话；桥接 CLI 不允许读取 input/getpass。无授权返回 auth_required，无明确书籍返回 selection_required，交由对话继续。credentials.py 的 Windows DPAPI 保护绑定当前用户，必须使用相同执行身份；沙箱无用户配置时需要宿主后台本机权限。任何平台都不能以明文文件回退。测试使用假的 Key，不读取真实剪贴板或用户授权。
+
 ## 发布一次版本
 
 1. 修改源代码和必要测试；在插件 plugin.json 提升三段式版本号。运行 `python -m unittest -b`。
