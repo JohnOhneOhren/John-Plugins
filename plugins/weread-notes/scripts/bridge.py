@@ -64,7 +64,7 @@ def connector_plan(book, sync_mode='incremental'):
                 parts.append('<p color="gray">' + markdown_text(text) + '</p>')
             else:
                 parts.append(markdown_text(text))
-                if kind == 'subtitle':
+                if kind in ('subtitle', 'quote'):
                     parts.append('<p />')
                 if kind == 'quote':
                     anchor = text
@@ -97,6 +97,7 @@ def main(argv=None):
     sync.add_argument('--plan', type=Path, required=True)
     sync.add_argument('--existing', type=Path, required=True)
     sync.add_argument('--receipt', type=Path)
+    sync.add_argument('--respect-deletions', action='store_true', help='保留用户手动删除状态，不补回；默认按目标实际内容补齐')
     sync.add_argument('--output', type=Path, required=True)
     auth = sub.add_parser('auth')
     auth_sub = auth.add_subparsers(dest='auth_command', required=True)
@@ -133,12 +134,14 @@ def main(argv=None):
             elif args.command == 'sync-plan':
                 delta = incremental.notion_delta(json.loads(args.plan.read_text(encoding='utf-8')),
                                                 json.loads(args.existing.read_text(encoding='utf-8')),
-                                                json.loads(args.receipt.read_text(encoding='utf-8')) if args.receipt else None)
+                                                json.loads(args.receipt.read_text(encoding='utf-8')) if args.receipt else None,
+                                                respect_deletions=args.respect_deletions)
                 args.output.parent.mkdir(parents=True, exist_ok=True)
                 core.atomic_json(args.output, delta)
                 result = {'path': str(args.output.resolve()), 'retained': delta['retained'],
                           'added_sources': delta['added_sources'], 'added_comments': delta['added_comments'],
-                          'unresolved': len(delta['unresolved'])}
+                          'restored_sources': delta['restored_sources'], 'restored_comments': delta['restored_comments'],
+                          'spacing': len(delta['spacing']), 'unresolved': len(delta['unresolved'])}
             elif args.command == 'auth':
                 if args.auth_command == 'status':
                     result = credentials.status()

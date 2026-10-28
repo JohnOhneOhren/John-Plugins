@@ -1141,7 +1141,7 @@ def export_word(book: Notebook, output: Path) -> Path:
         for run in p.runs:
             run.italic = False
         if kind in ("quote", "thought", "liked"):
-            p.paragraph_format.space_after = Pt(5 if index < len(unit) - 1 else 16)
+            p.paragraph_format.space_after = Pt(16.5)  # 每条笔记后留约一行，正文仍通过缩进/评论关联。
             short_unit = sum(len(value) for _, value in unit) <= 700 and len(unit) <= 6
             p.paragraph_format.keep_with_next = index < len(unit) - 1 and (short_unit or kind == "quote")
             if any(t == "quote" for t, _ in unit):
@@ -1214,7 +1214,7 @@ def notion_plan(book: Notebook) -> tuple[list[dict], list[dict]]:
             if kind == "quote":
                 anchor_index = len(blocks)
             blocks.extend(make_blocks(kind, text))
-            if kind in ("subtitle", "heading_2"):
+            if kind in ("subtitle", "heading_2", "quote"):
                 # 真正的空段落；仅 Markdown 换行不会在 Notion 生成留白。
                 blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": []}})
     return blocks, comments

@@ -21,7 +21,7 @@ description: 从用户微信读书书架选书，导出按章节整理的划线�
 
 ## Notion 对话导入
 
-默认再次同步采用增量模式，先读 [references/incremental.md](references/incremental.md)。定位同书、同目标的旧笔记，完整读取当前正文和原生评论，运行 sync-plan 只补新增；既有内容不覆盖、不重复插入。已有原文上的新增评论也要导入，不能因为原文已存在就跳过整组。用户明确要求另建一份时才改用 --sync-mode new。
+默认再次同步采用目标实际内容对比，先读 [references/incremental.md](references/incremental.md)。定位同书、同目标的旧笔记，重新读取完整当前正文和全部原生评论（包括已解决），运行 sync-plan 补齐新增和被删除的缺项；不能仅凭旧回执断言“无新增”。既有内容不覆盖、不重复插入。已有原文上的新增评论也要导入，不能因为原文已存在就跳过整组。每条摘抄间留一个真实空段落，已存在则不叠加。用户明确要求保留 Notion 的手动删除状态才用 --respect-deletions；明确另建一份才用 --sync-mode new。
 
 优先用用户已经连接的 Notion 工具；缺少连接时引导连接，或提供脚本 Integration Token 方式，不能声称插件捆绑了用户的 Notion 账号。阅读 Notion 工具要求的 Markdown 规范。
 

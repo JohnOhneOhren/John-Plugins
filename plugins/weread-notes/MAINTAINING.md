@@ -4,6 +4,8 @@
 
 0.4.0 默认插件增量同步。incremental.py 对实际 Notion 快照及同页回执生成只添加的计划，不执行远端覆盖。Word 通过隐藏书签保护已有段落身份，新增段落从同版排版模板复制，不重建既有 XML。备份及原子保存用于失败恢复。无回执的旧版按同章节精确文本匹配，存在歧义必须停止，不模糊合并。完整协议见 skills/weread-notes/references/incremental.md。
 
+0.4.1 修复旧回执阻止补回目标删除项的问题：默认以本次完整远端快照为准，completed 和 comment_parts 都必须核对远端存在性。正文快照新增 body_complete:true，评论读取需包含已解决线程。只在显式 --respect-deletions 时保留旧删除状态。每条 Notion 摘抄后是真实空段落，spacing 任务迁移旧版留白；Word 对导入条目采用约一行段后间距。格式任务无需新增笔记也应执行，已有空行不再叠加。
+
 0.2.0 默认交互为 Codex 对话；桥接 CLI 不允许读取 input/getpass。无授权返回 auth_required，无明确书籍返回 selection_required，交由对话继续。credentials.py 的 Windows DPAPI 保护绑定当前用户，必须使用相同执行身份；沙箱无用户配置时需要宿主后台本机权限。任何平台都不能以明文文件回退。测试使用假的 Key，不读取真实剪贴板或用户授权。
 
 0.3.0 将首次 Key 授权独立为聊天步骤，须先收到 Key 及“确定”再调用 auth import --stdin --confirmed。只有该命令读取后台进程 stdin；shelf/prepare 仍不读取输入。auth_transport.mjs 提供 JavaScript 宿主的隐藏管道转交，不能把 Key 拼接进 shell。剪贴板仍为显式可选的兼容路径，不能作为默认要求。授权成功摘要不混入选书，测试覆盖确认前不请求、不保存及实际子进程 stdin 转交。

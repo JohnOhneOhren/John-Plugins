@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "weread-notes",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "微信读书笔记：在 Codex 对话中选书，后台导出 Word 或 Notion，无需终端交互。",
   "extensions": {"com.openai": {"requires_local_executor": true}}
 }

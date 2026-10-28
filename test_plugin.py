@@ -46,7 +46,8 @@ class PluginTests(unittest.TestCase):
         for comment in plan['comments']:
             self.assertIn(bridge.markdown_text(comment['selection']), plan['content'])
             self.assertEqual(comment['anchor_kind'], 'paragraph')
-        self.assertEqual(plan['content'].count('<p />'), 1 + len(book.chapters))
+        sources = sum(kind == 'quote' for kind, _ in bridge.core.entries(book))
+        self.assertEqual(plan['content'].count('<p />'), 1 + len(book.chapters) + sources)
         self.assertEqual(plan, bridge.connector_plan(book))
 
     def test_checksum_failure_keeps_active_version(self):

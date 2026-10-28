@@ -26,7 +26,7 @@ def book(extra=False, show_dates=False):
 
 
 def snapshot():
-    return {'book_id': 'book-1', 'page_id': 'page-1', 'comments_complete': True,
+    return {'book_id': 'book-1', 'page_id': 'page-1', 'body_complete': True, 'comments_complete': True,
             'chapters': [{'title': '第一章', 'paragraphs': [{'text': '旧原文', 'id': 'block1'}]}],
             'comments': [{'id': 'comment1', 'chapter_title': '第一章', 'selection': '旧原文', 'text': '我的想法\n旧想法'}]}
 
@@ -82,8 +82,8 @@ class IncrementalTests(unittest.TestCase):
         remote = snapshot()
         remote['chapters'][0]['paragraphs'] = []
         receipt = {'book_id': 'book-1', 'page_id': 'page-1', 'completed': [{'key': plan['records'][0]['key']}]}
-        delta = inc.notion_delta(plan, remote, receipt)
-        self.assertEqual(delta['added_sources'], 1)  # 只有真正的新原文，旧原文不重建。
+        delta = inc.notion_delta(plan, remote, receipt, respect_deletions=True)
+        self.assertEqual(delta['added_sources'], 1)  # 用户明确保留删除状态时不重建。
         self.assertTrue(delta['unresolved'])
 
     def test_partial_long_comment_retries_only_unfinished_parts(self):
@@ -93,9 +93,72 @@ class IncrementalTests(unittest.TestCase):
         key = next(r['key'] for r in plan['records'] if r['kind'] == 'thought')
         receipt = {'book_id': 'book-1', 'page_id': 'page-1', 'completed': [],
                    'comment_parts': [{'key': key, 'part': 0, 'remote_id': 'comment-part1'}]}
-        delta = inc.notion_delta(plan, snapshot(), receipt)
+        remote = snapshot()
+        first = inc.comment_parts(next(r for r in plan['records'] if r['key'] == key))[0]
+        remote['comments'].append({'id': 'comment-part1', 'chapter_title': '第一章', 'selection': '旧原文',
+                                   'text': ''.join(p['text']['content'] for p in first['rich_text'])})
+        delta = inc.notion_delta(plan, remote, receipt)
         self.assertTrue(delta['comments'])
         self.assertTrue(all(job['part'] > 0 for job in delta['comments'][0]['jobs']))
+
+    def test_deleted_original_is_restored_despite_old_receipt(self):
+        plan = bridge.connector_plan(book())
+        remote = snapshot()
+        remote['chapters'][0]['paragraphs'] = []
+        remote['comments'] = []
+        receipt = {'book_id': 'book-1', 'page_id': 'page-1', 'completed': [
+            {'key': plan['records'][0]['key'], 'remote_id': 'deleted-block'},
+            {'key': plan['records'][1]['key'], 'remote_id': 'deleted-comment'}]}
+        delta = inc.notion_delta(plan, remote, receipt)
+        self.assertEqual((delta['added_sources'], delta['added_comments']), (1, 1))
+        self.assertEqual((delta['restored_sources'], delta['restored_comments']), (1, 1))
+        self.assertEqual(delta['comments'][0]['selection'], '旧原文')
+
+    def test_deleted_comment_is_restored_without_duplicating_original(self):
+        plan = bridge.connector_plan(book())
+        remote = snapshot()
+        remote['comments'] = []
+        receipt = {'book_id': 'book-1', 'page_id': 'page-1', 'completed': [
+            {'key': plan['records'][1]['key'], 'remote_id': 'deleted-comment'}]}
+        delta = inc.notion_delta(plan, remote, receipt)
+        self.assertEqual((delta['added_sources'], delta['added_comments']), (0, 1))
+        self.assertEqual(delta['comments'][0]['anchor_block_id'], 'block1')
+
+    def test_spacing_is_added_once_and_incomplete_body_is_rejected(self):
+        plan = bridge.connector_plan(book())
+        remote = snapshot()
+        self.assertEqual(len(inc.notion_delta(plan, remote)['spacing']), 1)
+        remote['chapters'][0]['paragraphs'][0]['blank_after'] = True
+        self.assertEqual(inc.notion_delta(plan, remote)['spacing'], [])
+        remote['body_complete'] = False
+        with self.assertRaises(inc.SyncError):
+            inc.notion_delta(plan, remote)
+
+    def test_deleted_long_comment_part_is_not_trusted_from_receipt(self):
+        current = book()
+        current.chapters[0].groups[0].thoughts[0].text = '长评论' * 20000
+        plan = bridge.connector_plan(current)
+        key = next(r['key'] for r in plan['records'] if r['kind'] == 'thought')
+        receipt = {'book_id': 'book-1', 'page_id': 'page-1',
+                   'comment_parts': [{'key': key, 'part': 0, 'remote_id': 'gone'}]}
+        delta = inc.notion_delta(plan, snapshot(), receipt)
+        self.assertIn(0, [job['part'] for job in delta['comments'][0]['jobs']])
+
+    def test_completed_long_comment_with_missing_part_is_repaired(self):
+        current = book()
+        current.chapters[0].groups[0].thoughts[0].text = '长评论' * 20000
+        plan = bridge.connector_plan(current)
+        record = next(r for r in plan['records'] if r['kind'] == 'thought')
+        first = inc.comment_parts(record)[0]
+        remote = snapshot()
+        remote['comments'] = [{'id': 'part0', 'chapter_title': '第一章', 'selection': '旧原文',
+                               'text': ''.join(p['text']['content'] for p in first['rich_text'])}]
+        receipt = {'book_id': 'book-1', 'page_id': 'page-1',
+                   'completed': [{'key': record['key'], 'remote_id': 'part0'}],
+                   'comment_parts': [{'key': record['key'], 'part': 0, 'remote_id': 'part0'},
+                                     {'key': record['key'], 'part': 1, 'remote_id': 'deleted'}]}
+        delta = inc.notion_delta(plan, remote, receipt)
+        self.assertEqual([j['part'] for j in delta['comments'][0]['jobs']], [1])
 
     def test_incomplete_comments_and_wrong_receipt_stop_sync(self):
         plan = bridge.connector_plan(book())

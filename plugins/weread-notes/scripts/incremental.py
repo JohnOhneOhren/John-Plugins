@@ -76,24 +76,28 @@ def comment_parts(record):
     return jobs
 
 
-def notion_delta(plan, snapshot, receipt=None):
+def notion_delta(plan, snapshot, receipt=None, respect_deletions=False):
     """输入实际读取的远端快照，输出仅新增的正文/评论；不执行远端写入。
 
     snapshot: {book_id,page_id,chapters:[{title,paragraphs:[{text,id?}]}],
-               comments:[{id?,chapter_title,selection,text}],comments_complete:true}
+               comments:[{id?,chapter_title,selection,text}],body_complete:true,comments_complete:true}
     receipt: {book_id,page_id,completed:[{key,remote_id?}]}，写入确认后才记录。
     """
     if not isinstance(plan.get('records'), list):
         raise SyncError('old_plan', '旧版导出计划不含增量身份，请重新抓取生成新版计划。')
     if snapshot.get('book_id') != plan['book_id'] or not snapshot.get('page_id'):
         raise SyncError('wrong_destination', '快照必须对应当前书籍及具体目标页面。')
+    if snapshot.get('body_complete') is not True:
+        raise SyncError('body_not_read', '请完整读取目标页正文后再比较，避免把截断或读取失败误判为笔记被删除。')
     if not snapshot.get('comments_complete') and any(r['kind'] != 'source' for r in plan['records']):
         raise SyncError('comments_not_read', '请先完整读取目标页的评论，再进行增量对比，避免重复评论。')
     receipt = receipt or {}
     if receipt and (receipt.get('book_id') != plan['book_id'] or receipt.get('page_id') != snapshot['page_id']):
         raise SyncError('wrong_receipt', '同步记录属于其他书籍或页面，不能混用。')
     completed = {r['key']: r for r in receipt.get('completed', [])}
-    completed_parts = {(r['key'], r['part']) for r in receipt.get('comment_parts', [])}
+    live_comment_ids = {c['id'] for c in snapshot.get('comments', []) if c.get('id')}
+    completed_parts = {(r['key'], r['part']) for r in receipt.get('comment_parts', [])
+                       if respect_deletions or r.get('remote_id') in live_comment_ids}
     chapters = {}
     for chapter in snapshot.get('chapters', []):
         name = normalized(chapter['title'])
@@ -102,7 +106,8 @@ def notion_delta(plan, snapshot, receipt=None):
         chapters[name] = chapter
     result = {'schema_version': 1, 'book_id': plan['book_id'], 'page_id': snapshot['page_id'],
               'plan_fingerprint': plan['fingerprint'], 'chapters': [], 'comments': [],
-              'retained': 0, 'matched': [], 'unresolved': []}
+              'retained': 0, 'restored_sources': 0, 'restored_comments': 0,
+              'matched': [], 'unresolved': [], 'spacing': []}
     additions, sources = {}, {}
     all_paragraphs = [p for c in chapters.values() for p in c.get('paragraphs', [])]
     for record in plan['records']:
@@ -115,23 +120,30 @@ def notion_delta(plan, snapshot, receipt=None):
             if previous and previous.get('remote_id'):
                 by_id = [p for p in all_paragraphs if p.get('id') == previous['remote_id']]
                 matches = by_id or matches
-            if matches or previous:
+            if matches or previous and respect_deletions:
                 result['retained'] += 1
                 result['matched'].append({'key': record['key'], 'remote_id': matches[0].get('id') if len(matches) == 1 else None})
-                # 旧回执证明导入过，但原文被手动改写/删除且无可定位 ID 时，不重建原文。
+                if len(matches) == 1 and matches[0].get('blank_after') is not True:
+                    result['spacing'].append({'key': record['key'], 'chapter_title': record['chapter_title'],
+                                              'selection': matches[0]['text'], 'block_id': matches[0].get('id')})
                 sources[record['key']] = matches[0] if len(matches) == 1 else None
                 continue
             group = additions.setdefault(name, {'uid': record['chapter_uid'], 'title': record['chapter_title'],
                                                 'order': record['chapter_order'],
                                                 'new_chapter': chapter is None, 'paragraphs': []})
-            group['paragraphs'].append({'key': record['key'], 'text': record['text']})
+            group['paragraphs'].append({'key': record['key'], 'text': record['text'], 'blank_after': True,
+                                        'restored': bool(previous)})
+            result['restored_sources'] += bool(previous)
             sources[record['key']] = {'text': record['text'], 'new': True}
         else:
             matches = [c for c in snapshot.get('comments', [])
                        if normalized(c.get('chapter_title')) == name and normalized(c.get('text')) in variants
                        and ((not record['source_key'] and not c.get('selection')) or
                             normalized(c.get('selection')) in {normalized(v) for v in record['source_variants']})]
-            if previous or matches:
+            # 长评论分为多条：首条仍在不能证明所有分片都在，继续逐片核对。
+            previous_still_present = bool(previous and previous.get('remote_id') in live_comment_ids
+                                          and len(comment_parts(record)) == 1)
+            if previous_still_present or matches or previous and respect_deletions:
                 result['retained'] += 1
                 result['matched'].append({'key': record['key'], 'remote_id': matches[0].get('id') if matches else previous.get('remote_id')})
                 continue
@@ -139,14 +151,22 @@ def notion_delta(plan, snapshot, receipt=None):
             if not anchor:
                 result['unresolved'].append({'key': record['key'], 'reason': '对应原文已修改、删除或有多个匹配，请先定位原文再关联新评论。'})
                 continue
-            jobs = [job for job in comment_parts(record) if (record['key'], job['part']) not in completed_parts]
+            jobs = []
+            for job in comment_parts(record):
+                target_text = normalized(''.join(p['text']['content'] for p in job['rich_text']))
+                part_present = any(normalized(c.get('chapter_title')) == name and
+                                   normalized(c.get('selection')) == normalized(anchor['text']) and
+                                   normalized(c.get('text')) == target_text for c in snapshot.get('comments', []))
+                if (record['key'], job['part']) not in completed_parts and not part_present:
+                    jobs.append(job)
             if not jobs:
                 result['retained'] += 1
                 result['matched'].append({'key': record['key'], 'remote_id': None})
                 continue
             result['comments'].append({'key': record['key'], 'chapter_title': record['chapter_title'],
                                        'selection': anchor['text'], 'anchor_block_id': anchor.get('id'),
-                                       'source_key': record['source_key'], 'jobs': jobs})
+                                       'source_key': record['source_key'], 'jobs': jobs, 'restored': bool(previous)})
+            result['restored_comments'] += bool(previous)
     result['chapters'] = list(additions.values())
     for chapter in result['chapters']:
         next_titles = [r['chapter_title'] for r in plan['records'] if r['chapter_order'] > chapter['order']
@@ -162,6 +182,7 @@ def export_word_incremental(book, output, target=None, fresh=False):
     from docx import Document
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
+    from docx.shared import Pt
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     index = output / ('word-sync-' + identifier(book.book_id)[:20] + '.json')
@@ -263,13 +284,20 @@ def export_word_incremental(book, output, target=None, fresh=False):
                 doc.element.body.insert(len(doc.element.body) - 1, deepcopy(heading._p))
             doc.element.body.insert(len(doc.element.body) - 1, element)
 
-        retained, added, changed = 0, 0, False
+        retained, added, changed, spacing_adjusted = 0, 0, False, 0
         for record in records:
-            if marked(record['key']) is not None:
+            marked_paragraph = marked(record['key'])
+            if marked_paragraph is not None:
+                if marked_paragraph.paragraph_format.space_after != Pt(16.5):
+                    marked_paragraph.paragraph_format.space_after = Pt(16.5)
+                    changed = True
+                    spacing_adjusted += 1
                 retained += 1
                 continue
             existing = matching(record)
             if existing is not None:
+                spacing_adjusted += existing.paragraph_format.space_after != Pt(16.5)
+                existing.paragraph_format.space_after = Pt(16.5)
                 mark(existing, record['key'])
                 retained += 1
                 changed = True
@@ -305,4 +333,5 @@ def export_word_incremental(book, output, target=None, fresh=False):
     if path.resolve().parent == output.resolve():
         core.atomic_json(index, {'book_id': book.book_id, 'file': path.name})
     return {'path': str(path.resolve()), 'added': len(records) if new_document else added,
-            'retained': 0 if new_document else retained, 'incremental': not new_document}
+            'retained': 0 if new_document else retained, 'incremental': not new_document,
+            'spacing_adjusted': spacing_adjusted}
