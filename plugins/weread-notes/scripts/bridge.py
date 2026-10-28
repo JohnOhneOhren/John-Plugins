@@ -12,6 +12,7 @@ import sys
 from zoneinfo import ZoneInfo
 import weread_notes as core
 import credentials
+import incremental
 
 
 class SelectionError(core.ExportError):
@@ -44,7 +45,7 @@ def markdown_text(text):
     return re.sub(r'([\\`*_\[\]])', r'\\\1', text).replace('\n', '\\\n')
 
 
-def connector_plan(book):
+def connector_plan(book, sync_mode='incremental'):
     """从同一语义单元生成正文和独立评论，不破坏原文关联。"""
     parts, comments = [], []
     chapter = None
@@ -58,16 +59,7 @@ def connector_plan(book):
                 parts.extend(['## ' + markdown_text(text), '<p />'])
                 chapter, seen = text, True
             elif kind in ('thought', 'liked'):
-                label, _, body = text.partition('\n')
-                chunks = core.text_chunks(body)
-                for offset in range(0, len(chunks), 20):
-                    rich_text = [{'type': 'text', 'text': {'content': label + ('（续）' if offset else '')},
-                                  'annotations': {'bold': True}}]
-                    rich_text.extend({'type': 'text', 'text': {'content': ('\n' if i == 0 else '') + part},
-                                      'annotations': {'italic': False}}
-                                     for i, part in enumerate(chunks[offset:offset + 20]))
-                    comments.append({'selection': anchor or chapter,
-                                     'anchor_kind': 'paragraph' if anchor else 'chapter', 'rich_text': rich_text})
+                continue  # 由稳定记录生成带 key/part 的评论，支持逐条保存同步回执。
             elif kind == 'notice':
                 parts.append('<p color="gray">' + markdown_text(text) + '</p>')
             else:
@@ -76,8 +68,19 @@ def connector_plan(book):
                     parts.append('<p />')
                 if kind == 'quote':
                     anchor = text
-    plan = {'schema_version': 1, 'book_id': book.book_id, 'title': book.title + ' 读书笔记',
-            'content': '\n\n'.join(parts), 'comments': comments, 'warnings': core.concise_notices(book.warnings)}
+    records = incremental.records_for(book)
+    sources = {r['key']: r for r in records if r['kind'] == 'source'}
+    for record in records:
+        if record['kind'] == 'source':
+            continue
+        source = sources.get(record['source_key'])
+        for part in incremental.comment_parts(record):
+            comments.append({'key': record['key'], **part,
+                             'selection': source['text'] if source else record['chapter_title'],
+                             'anchor_kind': 'paragraph' if source else 'chapter'})
+    plan = {'schema_version': 2, 'book_id': book.book_id, 'title': book.title + ' 读书笔记',
+            'content': '\n\n'.join(parts), 'comments': comments, 'warnings': core.concise_notices(book.warnings),
+            'sync_mode': sync_mode, 'records': records}
     plan['fingerprint'] = hashlib.sha256(json.dumps(plan, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     return plan
 
@@ -90,6 +93,11 @@ def main(argv=None):
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('doctor')
     sub.add_parser('shelf')
+    sync = sub.add_parser('sync-plan', help='对实际目标快照生成只新增的 Notion 同步计划，不执行远端写入')
+    sync.add_argument('--plan', type=Path, required=True)
+    sync.add_argument('--existing', type=Path, required=True)
+    sync.add_argument('--receipt', type=Path)
+    sync.add_argument('--output', type=Path, required=True)
     auth = sub.add_parser('auth')
     auth_sub = auth.add_subparsers(dest='auth_command', required=True)
     auth_sub.add_parser('status')
@@ -109,6 +117,8 @@ def main(argv=None):
     prep.add_argument('--output', type=Path, default=Path.cwd() / 'Weread_Notes_Output')
     prep.add_argument('--personal-only', action='store_true')
     prep.add_argument('--demo', action='store_true')
+    prep.add_argument('--sync-mode', choices=['incremental', 'new'], default='incremental')
+    prep.add_argument('--word-target', type=Path)
     prep.add_argument('--max-review-checks', type=int, default=200)
     prep.add_argument('--max-review-ranges', type=int, default=500)
     args = parser.parse_args(argv)
@@ -120,6 +130,15 @@ def main(argv=None):
                           'weread_authorized_in_environment': bool(os.environ.get('WEREAD_API_KEY')),
                           'auth': credentials.status(), 'interaction': 'codex_chat_only',
                           'edge_required': False, 'notion_connector': '由 Codex 检查当前用户连接'}
+            elif args.command == 'sync-plan':
+                delta = incremental.notion_delta(json.loads(args.plan.read_text(encoding='utf-8')),
+                                                json.loads(args.existing.read_text(encoding='utf-8')),
+                                                json.loads(args.receipt.read_text(encoding='utf-8')) if args.receipt else None)
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                core.atomic_json(args.output, delta)
+                result = {'path': str(args.output.resolve()), 'retained': delta['retained'],
+                          'added_sources': delta['added_sources'], 'added_comments': delta['added_comments'],
+                          'unresolved': len(delta['unresolved'])}
             elif args.command == 'auth':
                 if args.auth_command == 'status':
                     result = credentials.status()
@@ -161,9 +180,10 @@ def main(argv=None):
                     book.show_dates = args.dates == 'show'
                     args.output.mkdir(parents=True, exist_ok=True)
                     if args.format == 'word':
-                        result = {'path': str(core.export_word(book, args.output).resolve())}
+                        result = incremental.export_word_incremental(book, args.output, args.word_target,
+                                                                     fresh=args.sync_mode == 'new')
                     else:
-                        plan = connector_plan(book)
+                        plan = connector_plan(book, sync_mode=args.sync_mode)
                         path = args.output / (core.safe_filename(book.title) + '-' + plan['fingerprint'][:12] + '.notion-plan.json')
                         core.atomic_json(path, plan)
                         result = {'path': str(path.resolve()), 'fingerprint': plan['fingerprint'],
@@ -178,6 +198,10 @@ def main(argv=None):
         print(json.dumps({'status': 'selection_required', 'code': 'selection_required',
                           'message': str(exc), 'books': exc.books}, ensure_ascii=False))
         return 2
+    except incremental.SyncError as exc:
+        print(json.dumps({'status': 'sync_attention_required', 'code': exc.code,
+                          'message': str(exc), 'choices': exc.choices}, ensure_ascii=False))
+        return 4
     except credentials.AuthError as exc:
         print(json.dumps({'status': 'confirmation_required' if exc.code == 'confirmation_required' else 'auth_required',
                           'code': exc.code, 'message': str(exc)}, ensure_ascii=False))

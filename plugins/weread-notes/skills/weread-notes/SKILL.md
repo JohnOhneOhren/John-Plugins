@@ -21,15 +21,19 @@ description: 从用户微信读书书架选书，导出按章节整理的划线�
 
 ## Notion 对话导入
 
+默认再次同步采用增量模式，先读 [references/incremental.md](references/incremental.md)。定位同书、同目标的旧笔记，完整读取当前正文和原生评论，运行 sync-plan 只补新增；既有内容不覆盖、不重复插入。已有原文上的新增评论也要导入，不能因为原文已存在就跳过整组。用户明确要求另建一份时才改用 --sync-mode new。
+
 优先用用户已经连接的 Notion 工具；缺少连接时引导连接，或提供脚本 Integration Token 方式，不能声称插件捆绑了用户的 Notion 账号。阅读 Notion 工具要求的 Markdown 规范。
 
-读取 prepare 生成的 notion-plan JSON：content 是普通正文、章节 heading_2、章节横线和明确空段落 `<p />`，comments 单独存放。不可改为 quote 竖线、斜体正文、用户名或赞数。
+读取 prepare 生成的 notion-plan JSON：content 是首次导入时使用的完整正文；增量导入必须使用 sync-plan 的结果，不能再次追加 content。records 是稳定去重身份，comments 单独存放。正文保持普通段落、章节 heading_2、横线和明确空段落 `<p />`。不可改为 quote 竖线、斜体正文、用户名或赞数。
 
 写入前 fetch 目标，保留已有内容与子页。指定页面使用追加或针对空白的最小更新；另建子页仅在明确选择时执行。数据库先 fetch 并解析 data_source 和真实标题字段。新私有笔记使用工具支持的 draft 模式。没有原生评论能力时先说明，不能把正文写入称为完整成功。
 
 将每个 comment 的 rich_text 关联到对应 selection 原文。出现多个匹配时，用实际读取到的邻近上下文消歧；不能默默绑定错误段落。跨段选区无法实现时，可退为该段块评论并说明。保持“我的想法”“读者观点”标签，日期仅按用户选择附在正文末尾。公共 notion-client API 只能新建整段块评论，不能冒充文字选区评论。
 
 成功后在用户输出目录保存导入回执，包含 plan fingerprint、目标 page_id、每条完成的 comment_id；不保存凭证。重试先核对回执和远端状态，避免重复追加或重复评论。报告部分失败并恢复未完成部分，不能自动重建整页。
+
+Word 也默认增量更新，遵循同一增量参考。目标文件有歧义时在对话中选定并传 --word-target；不会重复询问书名。明确另存全新文件才用 --sync-mode new。
 
 ## 完整性与更新
 

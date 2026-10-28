@@ -13,6 +13,7 @@ FILES = [
     'skills/weread-notes/SKILL.md', 'skills/weread-notes/agents/openai.yaml',
     'scripts/launch.py', 'scripts/updates.py', 'scripts/bridge.py', 'scripts/weread_notes.py', 'scripts/credentials.py',
     'scripts/auth_transport.mjs',
+    'scripts/incremental.py', 'skills/weread-notes/references/incremental.md',
 ]
 
 
