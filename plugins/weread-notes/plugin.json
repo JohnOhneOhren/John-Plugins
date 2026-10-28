@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "weread-notes",
+  "version": "0.1.0",
+  "description": "微信读书笔记：按章节导出 Word，或将原文与关联评论导入 Notion。"
+}

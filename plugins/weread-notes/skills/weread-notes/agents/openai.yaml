@@ -1,0 +1,4 @@
+interface:
+  display_name: "微信读书笔记"
+  short_description: "从书架选书，整理划线、自己的想法与点赞观点，导出 Word 或 Notion"
+  default_prompt: "使用 $weread-notes 从我的微信读书书架选书，整理笔记并导出。"
