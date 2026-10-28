@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -30,6 +32,64 @@ def run_bridge(arguments):
 
 
 class ChatFlowTests(unittest.TestCase):
+    def test_chat_key_requires_confirmation_before_read_or_request(self):
+        class Unreadable:
+            def readline(self, *args):
+                raise AssertionError('确认前不能读取 Key')
+        with patch.object(sys, 'stdin', Unreadable()), patch.object(bridge.core, 'Weread') as client, \
+                patch.object(credentials, 'save_key') as save:
+            code, result = run_bridge(['auth', 'import', '--stdin'])
+        self.assertEqual(code, 3)
+        self.assertEqual(result['status'], 'confirmation_required')
+        client.assert_not_called()
+        save.assert_not_called()
+
+    def test_confirmed_chat_key_uses_pipe_without_clipboard_or_book_prompt(self):
+        with patch.object(sys, 'stdin', io.StringIO('wrk-chat-test\n')), \
+                patch.object(bridge.core, 'read_clipboard', side_effect=AssertionError('默认不能读剪贴板')), \
+                patch.object(bridge.core, 'Weread') as client, patch.object(credentials, 'save_key') as save:
+            client.return_value.shelf.return_value = BOOKS
+            code, result = run_bridge(['auth', 'import', '--stdin', '--confirmed'])
+        self.assertEqual(code, 0)
+        self.assertTrue(result['authorized'])
+        self.assertNotIn('books', result)
+        self.assertNotIn('wrk-chat-test', json.dumps(result))
+        save.assert_called_once_with('wrk-chat-test', remember=False)
+
+    def test_launcher_forwards_pipe_and_does_not_echo_invalid_input(self):
+        fake = 'invalid-private-fixture'
+        with tempfile.TemporaryDirectory() as folder:
+            run = subprocess.run([sys.executable, str(ROOT / 'plugins/weread-notes/scripts/launch.py'),
+                                  'auth', 'import', '--stdin', '--confirmed'], input=fake + '\n',
+                                 env={**os.environ, 'WEREAD_NOTES_STATE_DIR': folder},
+                                 capture_output=True, encoding='utf-8')
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('error', json.loads(run.stdout))
+        self.assertNotIn(fake, run.stdout + run.stderr)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node runtime required for host pipe adapter test')
+    def test_node_adapter_sends_key_in_pipe_not_child_arguments(self):
+        module = (ROOT / 'plugins/weread-notes/scripts/auth_transport.mjs').as_uri()
+        with tempfile.TemporaryDirectory() as folder:
+            fake_launcher = Path(folder) / 'fake_launcher.py'
+            fake_launcher.write_text(
+                'import json,sys\nkey=sys.stdin.readline().strip()\n'
+                'print(json.dumps({"authorized":key=="wrk-fake-transport" and not any("wrk-" in a for a in sys.argv),'
+                '"remembered":"--remember" in sys.argv}))\n', encoding='utf-8')
+            program = ('import {authorizeFromChat} from ' + json.dumps(module) + ';'
+                       'const pending=await authorizeFromChat({python:"missing",launcher:"missing",key:"wrk-fake-transport"});'
+                       'const result=await authorizeFromChat({python:process.argv[1],launcher:process.argv[2],'
+                       'key:"wrk-fake-transport",confirmed:true,remember:true});'
+                       'console.log(JSON.stringify({pending,result}));')
+            run = subprocess.run([shutil.which('node'), '--input-type=module', '-e', program,
+                                  sys.executable, str(fake_launcher)], capture_output=True, encoding='utf-8')
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(result['pending']['status'], 'confirmation_required')
+        self.assertTrue(result['result']['authorized'])
+        self.assertTrue(result['result']['remembered'])
+        self.assertNotIn('wrk-fake-transport', run.stdout + run.stderr)
+
     def test_missing_auth_is_a_chat_event_not_a_terminal_prompt(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {
                 'WEREAD_API_KEY': '', 'WEREAD_NOTES_STATE_DIR': folder}):

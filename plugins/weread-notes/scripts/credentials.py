@@ -1,4 +1,4 @@
-"""无窗口授权：主动读取一次剪贴板，用当前 Windows 用户 DPAPI 加密保存。
+"""无窗口授权：从已确认的聊天输入或主动选择的剪贴板取得 Key，DPAPI 加密保存。
 
 不扫描浏览器，不输出 Key，不把明文写入配置/命令行。不使用机器级保护范围。
 """
@@ -75,14 +75,14 @@ def get_key():
         return key
     path = vault_path()
     if not path.exists():
-        raise AuthError('auth_required', '请在官方授权页复制 Key，然后回到 Codex 说“已复制”，由插件后台读取；不用打开终端或把 Key 发到聊天。')
+        raise AuthError('auth_required', '请在 Codex 的独立授权步骤发送官方 Key，再回复“确定”；验证成功后才继续选书和导出。')
     try:
         value = json.loads(path.read_text(encoding='utf-8'))
         if value.get('schema') != 1 or value.get('protection') != 'windows-dpapi-current-user':
             raise ValueError()
         expires = value.get('expires_at')
         if expires is not None and (not isinstance(expires, (int, float)) or time.time() >= expires):
-            raise AuthError('auth_expired', '临时授权已过期，请重新复制 Key 并在对话中完成授权。')
+            raise AuthError('auth_expired', '临时授权已过期，请在对话中重新发送 Key 并确认授权。')
         key = protect(base64.b64decode(value['ciphertext'], validate=True), decrypt=True).decode('utf-8')
         core.validate_api_key(key)
         return key

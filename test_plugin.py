@@ -20,7 +20,7 @@ import updates
 from tools.build_plugin import build, FILES
 
 
-def archive_for(version='0.3.0', extra=None):
+def archive_for(version='99.0.0', extra=None):
     data = io.BytesIO()
     files = {
         'plugin.json': json.dumps({'name': 'weread-notes', 'version': version}).encode(),

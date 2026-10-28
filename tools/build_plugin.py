@@ -12,6 +12,7 @@ FILES = [
     'plugin.json', 'GUIDE.md', 'MAINTAINING.md', 'requirements.txt',
     'skills/weread-notes/SKILL.md', 'skills/weread-notes/agents/openai.yaml',
     'scripts/launch.py', 'scripts/updates.py', 'scripts/bridge.py', 'scripts/weread_notes.py', 'scripts/credentials.py',
+    'scripts/auth_transport.mjs',
 ]
 
 

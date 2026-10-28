@@ -95,8 +95,10 @@ def main(argv=None):
     auth_sub.add_parser('status')
     auth_sub.add_parser('forget')
     provision = auth_sub.add_parser('import')
-    provision.add_argument('--clipboard', action='store_true', required=True,
-                           help='仅在用户明确已复制 Key 后主动读取一次，不回显')
+    source = provision.add_mutually_exclusive_group(required=True)
+    source.add_argument('--stdin', action='store_true', help='从后台进程输入管道读取聊天中已确认的 Key，不回显')
+    source.add_argument('--clipboard', action='store_true', help='用户主动选择的兼容方式，不作为默认流程')
+    provision.add_argument('--confirmed', action='store_true', help='用户已在对话中发送“确定”，允许验证此 Key')
     provision.add_argument('--remember', action='store_true', help='同一 Windows 用户加密记住授权；默认仅保留 30 分钟')
     prep = sub.add_parser('prepare')
     selection = prep.add_mutually_exclusive_group()
@@ -124,13 +126,19 @@ def main(argv=None):
                 elif args.auth_command == 'forget':
                     result = credentials.forget()
                 else:
-                    # 不调用 input/getpass/PowerShell，不在 stdout、stderr 或文件中输出 Key。
-                    key = core.read_clipboard().strip()
+                    # 聊天输入必须先确认；不以命令行参数传 Key，不调用终端 input/getpass。
+                    if args.stdin and not args.confirmed:
+                        raise credentials.AuthError('confirmation_required', '已收到 Key，请用户回复“确定”后再验证授权。')
+                    key = sys.stdin.readline(8193).strip() if args.stdin else core.read_clipboard().strip()
+                    if len(key) > 8192:
+                        raise core.ExportError('Key 输入过长，请只发送官方 Key。')
                     core.validate_api_key(key)
                     books = core.Weread(api_key=key, interactive_auth=False).shelf()
                     credentials.save_key(key, remember=args.remember)
                     result = {'authorized': True, 'remembered': args.remember,
-                              'expires_in_seconds': None if args.remember else 1800, 'books': book_choices(books)}
+                              'expires_in_seconds': None if args.remember else 1800}
+                    if args.clipboard:  # 保持旧调用兼容；默认聊天授权步骤不混入选书结果。
+                        result['books'] = book_choices(books)
             else:
                 if args.command == 'prepare' and min(args.max_review_checks, args.max_review_ranges) < 1:
                     raise core.ExportError('扫描上限必须大于 0。')
@@ -171,7 +179,8 @@ def main(argv=None):
                           'message': str(exc), 'books': exc.books}, ensure_ascii=False))
         return 2
     except credentials.AuthError as exc:
-        print(json.dumps({'status': 'auth_required', 'code': exc.code, 'message': str(exc)}, ensure_ascii=False))
+        print(json.dumps({'status': 'confirmation_required' if exc.code == 'confirmation_required' else 'auth_required',
+                          'code': exc.code, 'message': str(exc)}, ensure_ascii=False))
         return 3
     except Exception as exc:
         # 仅已知安全的自定义错误可展示；第三方异常可能包含凭证。

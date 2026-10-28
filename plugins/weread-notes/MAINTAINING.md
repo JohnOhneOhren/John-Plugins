@@ -4,6 +4,8 @@
 
 0.2.0 默认交互为 Codex 对话；桥接 CLI 不允许读取 input/getpass。无授权返回 auth_required，无明确书籍返回 selection_required，交由对话继续。credentials.py 的 Windows DPAPI 保护绑定当前用户，必须使用相同执行身份；沙箱无用户配置时需要宿主后台本机权限。任何平台都不能以明文文件回退。测试使用假的 Key，不读取真实剪贴板或用户授权。
 
+0.3.0 将首次 Key 授权独立为聊天步骤，须先收到 Key 及“确定”再调用 auth import --stdin --confirmed。只有该命令读取后台进程 stdin；shelf/prepare 仍不读取输入。auth_transport.mjs 提供 JavaScript 宿主的隐藏管道转交，不能把 Key 拼接进 shell。剪贴板仍为显式可选的兼容路径，不能作为默认要求。授权成功摘要不混入选书，测试覆盖确认前不请求、不保存及实际子进程 stdin 转交。
+
 ## 发布一次版本
 
 1. 修改源代码和必要测试；在插件 plugin.json 提升三段式版本号。运行 `python -m unittest -b`。
