@@ -103,23 +103,30 @@ def main(argv=None):
     auth_sub = auth.add_subparsers(dest='auth_command', required=True)
     auth_sub.add_parser('status')
     auth_sub.add_parser('forget')
+    retention_update = auth_sub.add_parser('retention', help='对现有可读取授权修改保存偏好，不重新输入 Key')
+    preference = retention_update.add_mutually_exclusive_group(required=True)
+    preference.add_argument('--remember', action='store_true')
+    preference.add_argument('--temporary', action='store_true')
     provision = auth_sub.add_parser('import')
     source = provision.add_mutually_exclusive_group(required=True)
     source.add_argument('--stdin', action='store_true', help='从后台进程输入管道读取聊天中已确认的 Key，不回显')
     source.add_argument('--clipboard', action='store_true', help='用户主动选择的兼容方式，不作为默认流程')
     provision.add_argument('--confirmed', action='store_true', help='用户已在对话中发送“确定”，允许验证此 Key')
-    provision.add_argument('--remember', action='store_true', help='同一 Windows 用户加密记住授权；默认仅保留 30 分钟')
+    retention = provision.add_mutually_exclusive_group()
+    retention.add_argument('--remember', action='store_true', help='用户明确选择长期记住授权')
+    retention.add_argument('--temporary', action='store_true', help='用户明确选择临时授权，仅加密缓存 30 分钟')
     prep = sub.add_parser('prepare')
     selection = prep.add_mutually_exclusive_group()
     selection.add_argument('--book-id')
     selection.add_argument('--book-name')
     prep.add_argument('--format', choices=['word', 'notion'], required=True)
     prep.add_argument('--dates', choices=['show', 'hide'], required=True)
-    prep.add_argument('--output', type=Path, default=Path.cwd() / 'Weread_Notes_Output')
+    prep.add_argument('--output', type=Path)
     prep.add_argument('--personal-only', action='store_true')
     prep.add_argument('--demo', action='store_true')
     prep.add_argument('--sync-mode', choices=['incremental', 'new'], default='incremental')
     prep.add_argument('--word-target', type=Path)
+    prep.add_argument('--word-mode', choices=['existing', 'new'], help='Word 需先在对话中选择更新旧文件或在指定文件夹新建')
     prep.add_argument('--max-review-checks', type=int, default=200)
     prep.add_argument('--max-review-ranges', type=int, default=500)
     args = parser.parse_args(argv)
@@ -147,10 +154,16 @@ def main(argv=None):
                     result = credentials.status()
                 elif args.auth_command == 'forget':
                     result = credentials.forget()
+                elif args.auth_command == 'retention':
+                    credentials.save_key(credentials.get_key(), remember=args.remember)
+                    result = {'retention_updated': True, 'remembered': args.remember,
+                              'expires_in_seconds': None if args.remember else 1800}
                 else:
                     # 聊天输入必须先确认；不以命令行参数传 Key，不调用终端 input/getpass。
                     if args.stdin and not args.confirmed:
                         raise credentials.AuthError('confirmation_required', '已收到 Key，请用户回复“确定”后再验证授权。')
+                    if not args.remember and not args.temporary:
+                        raise credentials.AuthError('retention_required', '请先询问用户：是否在这台电脑上长期记住微信读书 Key？选长期记住，或仅临时使用 30 分钟。')
                     key = sys.stdin.readline(8193).strip() if args.stdin else core.read_clipboard().strip()
                     if len(key) > 8192:
                         raise core.ExportError('Key 输入过长，请只发送官方 Key。')
@@ -162,6 +175,24 @@ def main(argv=None):
                     if args.clipboard:  # 保持旧调用兼容；默认聊天授权步骤不混入选书结果。
                         result['books'] = book_choices(books)
             else:
+                if args.command == 'prepare' and args.format == 'word':
+                    # 在鉴权、抓取和任何文件写入之前完成目标选择，不能静默更新上次文件。
+                    if not args.word_mode:
+                        raise incremental.SyncError('word_destination_required', '请在对话中选择：更新现有 Word 文件，或在指定文件夹新建。',
+                                                    ['更新现有 Word 文件', '选择文件夹新建 Word 文件'])
+                    if args.word_mode == 'existing':
+                        if not args.word_target:
+                            raise incremental.SyncError('word_target_required', '请输入要更新的 Word 文件完整路径。')
+                        if args.sync_mode == 'new':
+                            raise incremental.SyncError('word_destination_conflict', '更新现有文件不能同时选择新建模式。')
+                        if not args.word_target.is_file() or args.word_target.suffix.lower() != '.docx':
+                            raise incremental.SyncError('word_target_missing', '目标 Word 文件不存在或不是 .docx，请重新指定，不会自动新建替代文件。')
+                    elif not args.output:
+                        raise incremental.SyncError('word_folder_required', '请输入新建 Word 文件的目标文件夹路径。')
+                    elif args.word_target:
+                        raise incremental.SyncError('word_destination_conflict', '新建 Word 请选择目标文件夹，不要同时指定现有文件。')
+                    elif args.output.exists() and not args.output.is_dir():
+                        raise incremental.SyncError('word_folder_required', '新建位置应是文件夹，而不是文件。')
                 if args.command == 'prepare' and min(args.max_review_checks, args.max_review_ranges) < 1:
                     raise core.ExportError('扫描上限必须大于 0。')
                 if args.command == 'prepare' and args.demo:
@@ -181,10 +212,11 @@ def main(argv=None):
                         book = client.collect(selected, ZoneInfo('Asia/Shanghai'), 0)
                 if args.command == 'prepare':
                     book.show_dates = args.dates == 'show'
+                    args.output = args.output or Path.cwd() / 'Weread_Notes_Output'
                     args.output.mkdir(parents=True, exist_ok=True)
                     if args.format == 'word':
                         result = incremental.export_word_incremental(book, args.output, args.word_target,
-                                                                     fresh=args.sync_mode == 'new')
+                                                                     fresh=args.word_mode == 'new')
                     else:
                         plan = connector_plan(book, sync_mode=args.sync_mode)
                         path = args.output / (core.safe_filename(book.title) + '-' + plan['fingerprint'][:12] + '.notion-plan.json')
@@ -206,7 +238,7 @@ def main(argv=None):
                           'message': str(exc), 'choices': exc.choices}, ensure_ascii=False))
         return 4
     except credentials.AuthError as exc:
-        print(json.dumps({'status': 'confirmation_required' if exc.code == 'confirmation_required' else 'auth_required',
+        print(json.dumps({'status': exc.code if exc.code in ('confirmation_required', 'retention_required') else 'auth_required',
                           'code': exc.code, 'message': str(exc)}, ensure_ascii=False))
         return 3
     except Exception as exc:

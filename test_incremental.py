@@ -32,6 +32,59 @@ def snapshot():
 
 
 class IncrementalTests(unittest.TestCase):
+    def test_word_update_does_not_reformat_existing_notes(self):
+        from docx import Document
+        from docx.shared import Pt, RGBColor
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(inc.export_word_incremental(book(), Path(folder))['path'])
+            doc = Document(path)
+            source = next(p for p in doc.paragraphs if p.text == '旧原文')
+            source.paragraph_format.space_after = Pt(2)
+            source.runs[0].font.name = 'Arial'
+            source.runs[0].font.size = Pt(17)
+            source.runs[0].font.color.rgb = RGBColor.from_string('123456')
+            source.runs[0].italic = True
+            custom = doc.add_paragraph('用户自己写的感受')
+            custom.runs[0].bold = True
+            table = doc.add_table(rows=1, cols=1)
+            table.cell(0, 0).text = '用户手工表格'
+            doc.save(path)
+            before = Document(path)
+            source_xml = next(p for p in before.paragraphs if p.text == '旧原文')._p.xml
+            custom_xml = next(p for p in before.paragraphs if p.text == '用户自己写的感受')._p.xml
+            table_xml = before.tables[0]._tbl.xml
+            result = inc.export_word_incremental(book(extra=True), Path(folder), target=path)
+            after = Document(path)
+            self.assertEqual(next(p for p in after.paragraphs if p.text == '旧原文')._p.xml, source_xml)
+            self.assertEqual(next(p for p in after.paragraphs if p.text == '用户自己写的感受')._p.xml, custom_xml)
+            self.assertEqual(after.tables[0]._tbl.xml, table_xml)
+            self.assertEqual(result['added'], 2)
+            self.assertEqual(result['spacing_adjusted'], 0)
+            saved = path.read_bytes()
+            again = inc.export_word_incremental(book(extra=True), Path(folder), target=path)
+            self.assertEqual(again['added'], 0)
+            self.assertEqual(path.read_bytes(), saved)
+
+    def test_legacy_handwritten_word_without_headings_is_preserved(self):
+        from docx import Document
+        from docx.shared import Pt
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / '用户选定的文件.docx'
+            doc = Document()
+            source = doc.add_paragraph('旧原文')
+            source.paragraph_format.space_after = Pt(3)
+            custom = doc.add_paragraph('本地独有的手写笔记')
+            custom.runs[0].bold = True
+            doc.save(path)
+            before = Document(path)
+            custom_xml = before.paragraphs[1]._p.xml
+            result = inc.export_word_incremental(book(extra=True), Path(folder), target=path)
+            after = Document(path)
+            self.assertEqual([p.text for p in after.paragraphs].count('旧原文'), 1)
+            self.assertEqual(next(p for p in after.paragraphs if p.text == '旧原文').paragraph_format.space_after, Pt(3))
+            self.assertEqual(next(p for p in after.paragraphs if p.text == '本地独有的手写笔记')._p.xml, custom_xml)
+            self.assertEqual(result['added'], 3)
+
     def test_record_dates_are_plain_numeric_text_in_body_and_comments(self):
         current = book(show_dates=True)
         plan = bridge.connector_plan(current)

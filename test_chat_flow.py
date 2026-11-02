@@ -32,6 +32,60 @@ def run_bridge(arguments):
 
 
 class ChatFlowTests(unittest.TestCase):
+    def test_retention_choice_required_before_key_is_read(self):
+        class Unreadable:
+            def readline(self, *args):
+                raise AssertionError('保存偏好未确认前不能读取 Key')
+        with patch.object(sys, 'stdin', Unreadable()), patch.object(bridge.core, 'Weread') as client, \
+                patch.object(credentials, 'save_key') as save:
+            code, result = run_bridge(['auth', 'import', '--stdin', '--confirmed'])
+        self.assertEqual(code, 3)
+        self.assertEqual(result['status'], 'retention_required')
+        client.assert_not_called()
+        save.assert_not_called()
+
+    def test_existing_auth_can_be_remembered_without_resending_key(self):
+        with patch.object(credentials, 'get_key', return_value='wrk-existing-test'), \
+                patch.object(credentials, 'save_key') as save, \
+                patch.object(bridge.core, 'read_clipboard', side_effect=AssertionError('不应读取剪贴板')):
+            code, result = run_bridge(['auth', 'retention', '--remember'])
+        self.assertEqual(code, 0)
+        self.assertTrue(result['remembered'])
+        self.assertIsNone(result['expires_in_seconds'])
+        save.assert_called_once_with('wrk-existing-test', remember=True)
+
+    def test_word_destination_must_be_chosen_before_crawl_or_write(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(bridge.core, 'Weread') as client:
+            target = Path(folder) / 'not-created'
+            code, result = run_bridge(['prepare', '--format', 'word', '--dates', 'hide', '--output', str(target)])
+            self.assertEqual(code, 4)
+            self.assertEqual(result['code'], 'word_destination_required')
+            self.assertFalse(target.exists())
+            client.assert_not_called()
+
+    def test_word_requires_specific_file_or_new_folder(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(bridge.core, 'Weread') as client:
+            common = ['prepare', '--format', 'word', '--dates', 'hide']
+            code, result = run_bridge(common + ['--word-mode', 'new'])
+            self.assertEqual(result['code'], 'word_folder_required')
+            code, result = run_bridge(common + ['--word-mode', 'existing'])
+            self.assertEqual(result['code'], 'word_target_required')
+            code, result = run_bridge(common + ['--word-mode', 'existing', '--word-target', str(Path(folder) / 'missing.docx')])
+            self.assertEqual(result['code'], 'word_target_missing')
+            client.assert_not_called()
+
+    def test_word_new_mode_uses_selected_folder_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as folder:
+            args = ['prepare', '--demo', '--format', 'word', '--dates', 'hide', '--word-mode', 'new', '--output', folder]
+            code, first = run_bridge(args)
+            self.assertEqual(code, 0)
+            original = Path(first['path']).read_bytes()
+            code, second = run_bridge(args)
+            self.assertEqual(code, 0)
+            self.assertNotEqual(first['path'], second['path'])
+            self.assertEqual(Path(second['path']).parent, Path(folder))
+            self.assertEqual(Path(first['path']).read_bytes(), original)
+
     def test_chat_key_requires_confirmation_before_read_or_request(self):
         class Unreadable:
             def readline(self, *args):
@@ -49,7 +103,7 @@ class ChatFlowTests(unittest.TestCase):
                 patch.object(bridge.core, 'read_clipboard', side_effect=AssertionError('默认不能读剪贴板')), \
                 patch.object(bridge.core, 'Weread') as client, patch.object(credentials, 'save_key') as save:
             client.return_value.shelf.return_value = BOOKS
-            code, result = run_bridge(['auth', 'import', '--stdin', '--confirmed'])
+            code, result = run_bridge(['auth', 'import', '--stdin', '--confirmed', '--temporary'])
         self.assertEqual(code, 0)
         self.assertTrue(result['authorized'])
         self.assertNotIn('books', result)
@@ -60,7 +114,7 @@ class ChatFlowTests(unittest.TestCase):
         fake = 'invalid-private-fixture'
         with tempfile.TemporaryDirectory() as folder:
             run = subprocess.run([sys.executable, str(ROOT / 'plugins/weread-notes/scripts/launch.py'),
-                                  'auth', 'import', '--stdin', '--confirmed'], input=fake + '\n',
+                                  'auth', 'import', '--stdin', '--confirmed', '--temporary'], input=fake + '\n',
                                  env={**os.environ, 'WEREAD_NOTES_STATE_DIR': folder},
                                  capture_output=True, encoding='utf-8')
         self.assertEqual(run.returncode, 1)
@@ -74,20 +128,26 @@ class ChatFlowTests(unittest.TestCase):
             fake_launcher = Path(folder) / 'fake_launcher.py'
             fake_launcher.write_text(
                 'import json,sys\nkey=sys.stdin.readline().strip()\n'
-                'print(json.dumps({"authorized":key=="wrk-fake-transport" and not any("wrk-" in a for a in sys.argv),'
+                'print(json.dumps({"authorized":key=="wrk-fake-transport" and any(a in sys.argv for a in ("--remember","--temporary")) and not any("wrk-" in a for a in sys.argv),'
                 '"remembered":"--remember" in sys.argv}))\n', encoding='utf-8')
             program = ('import {authorizeFromChat} from ' + json.dumps(module) + ';'
                        'const pending=await authorizeFromChat({python:"missing",launcher:"missing",key:"wrk-fake-transport"});'
+                       'const undecided=await authorizeFromChat({python:"missing",launcher:"missing",key:"wrk-fake-transport",confirmed:true});'
                        'const result=await authorizeFromChat({python:process.argv[1],launcher:process.argv[2],'
                        'key:"wrk-fake-transport",confirmed:true,remember:true});'
-                       'console.log(JSON.stringify({pending,result}));')
+                       'const temporary=await authorizeFromChat({python:process.argv[1],launcher:process.argv[2],'
+                       'key:"wrk-fake-transport",confirmed:true,remember:false});'
+                       'console.log(JSON.stringify({pending,undecided,result,temporary}));')
             run = subprocess.run([shutil.which('node'), '--input-type=module', '-e', program,
                                   sys.executable, str(fake_launcher)], capture_output=True, encoding='utf-8')
         self.assertEqual(run.returncode, 0, run.stderr)
         result = json.loads(run.stdout)
         self.assertEqual(result['pending']['status'], 'confirmation_required')
+        self.assertEqual(result['undecided']['status'], 'retention_required')
         self.assertTrue(result['result']['authorized'])
         self.assertTrue(result['result']['remembered'])
+        self.assertTrue(result['temporary']['authorized'])
+        self.assertFalse(result['temporary']['remembered'])
         self.assertNotIn('wrk-fake-transport', run.stdout + run.stderr)
 
     def test_missing_auth_is_a_chat_event_not_a_terminal_prompt(self):
@@ -144,7 +204,7 @@ class ChatFlowTests(unittest.TestCase):
         with patch.object(bridge.core, 'read_clipboard', return_value='wrk-fake-secret'), \
                 patch.object(bridge.core, 'Weread') as client, patch.object(credentials, 'save_key') as save:
             client.return_value.shelf.side_effect = bridge.core.ExportError('授权失败')
-            code, result = run_bridge(['auth', 'import', '--clipboard'])
+            code, result = run_bridge(['auth', 'import', '--clipboard', '--temporary'])
             self.assertEqual(code, 1)
             save.assert_not_called()
 

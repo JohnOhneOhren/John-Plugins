@@ -2,6 +2,8 @@
 
 核心实现来源是仓库根目录 weread_notes.py，构建时同步到插件，不要分别修改两个副本。bridge.py 输出的 notion-plan schema_version=2，正文、稳定身份和评论分离。已有的单条点赞判断、严格章节关联、日期选择与精简版式均保留。
 
+0.5.0 需要先取得明确的 Key 保存偏好：auth import 必须 --remember 或 --temporary，缺省返回 retention_required；Node 管道适配器不能静默设 remember:false。auth retention 可复用现有加密授权调整保存方式。Word prepare 必须 --word-mode existing + --word-target，或 --word-mode new + 明确 --output 文件夹，检查在抓取之前完成。Word 增量更新完全不重设旧段落间距/字体，仅新增段落沿用排版模板；对无标题的手工旧文件只做唯一精确匹配。回归测试比较旧段落、用户手写段落及表格的 XML，确认添加前后未被重写。
+
 0.4.2 明确禁止将记录日期转换成 Notion date mention。生成器一直输出数字文本，连接器默认“日期使用提及”的建议不能覆盖用户指定格式。预检查最终正文和评论 payload 的日期为 text，迁移旧日期标签只做原值纯文本替换，保留原文、样式及讨论引用。
 
 0.4.0 默认插件增量同步。incremental.py 对实际 Notion 快照及同页回执生成只添加的计划，不执行远端覆盖。Word 通过隐藏书签保护已有段落身份，新增段落从同版排版模板复制，不重建既有 XML。备份及原子保存用于失败恢复。无回执的旧版按同章节精确文本匹配，存在歧义必须停止，不模糊合并。完整协议见 skills/weread-notes/references/incremental.md。

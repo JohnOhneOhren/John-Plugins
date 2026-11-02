@@ -54,6 +54,7 @@ def save_key(key, remember=False):
     core.validate_api_key(key)
     encrypted = protect(key.encode('utf-8'))
     value = {'schema': 1, 'protection': 'windows-dpapi-current-user',
+             'retention_choice_recorded': True,
              'expires_at': None if remember else time.time() + 1800,
              'ciphertext': base64.b64encode(encrypted).decode('ascii')}
     path = vault_path()
@@ -95,10 +96,15 @@ def get_key():
 def status():
     try:
         get_key()
+        metadata = {} if os.environ.get('WEREAD_API_KEY') else json.loads(vault_path().read_text(encoding='utf-8'))
         return {'available': True, 'source': 'environment' if os.environ.get('WEREAD_API_KEY') else 'encrypted_local',
+                'remembered': None if os.environ.get('WEREAD_API_KEY') else metadata.get('expires_at') is None,
+                'retention_choice_recorded': metadata.get('retention_choice_recorded', False),
                 'server_validated': False}
     except core.ExportError as exc:
         return {'available': False, 'code': getattr(exc, 'code', 'auth_invalid'), 'server_validated': False}
+    except (OSError, ValueError):
+        return {'available': False, 'code': 'auth_invalid', 'server_validated': False}
 
 
 def forget():

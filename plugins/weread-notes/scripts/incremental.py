@@ -182,7 +182,6 @@ def export_word_incremental(book, output, target=None, fresh=False):
     from docx import Document
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
-    from docx.shared import Pt
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     index = output / ('word-sync-' + identifier(book.book_id)[:20] + '.json')
@@ -241,14 +240,31 @@ def export_word_incremental(book, output, target=None, fresh=False):
     def matching(record):
         variants = {normalized(v) for v in record['variants']}
         candidates = in_chapter(record['chapter_title'])
+        # 老的手工 Word 可能没有章节样式。只在章外有唯一精确匹配且原文不跨章重名时沿用。
+        outside, inside = [], False
+        for paragraph in doc.paragraphs:
+            if paragraph.style.name == 'Heading 2':
+                inside = True
+            elif not inside and not paragraph.style.name.startswith('Heading') and paragraph.style.name != 'Subtitle':
+                outside.append(paragraph)
+        if not candidates:
+            possible = [p for p in outside if normalized(p.text) in variants]
+            if possible and record['kind'] == 'source':
+                chapter_ids = {r['chapter_uid'] for r in records if r['kind'] == 'source'
+                               and any(normalized(v) in variants for v in r['variants'])}
+                if len(chapter_ids) > 1:
+                    raise SyncError('word_chapter_required', '旧文档中相同原文可能属于多个章节，请先在对话中确认位置。')
+            candidates = outside
         if record['kind'] != 'source' and record.get('source_key'):
             anchor = marked(record['source_key'])
+            if anchor is not None and not any(p._p is anchor._p for p in candidates):
+                candidates = doc.paragraphs
             following, active = [], False
             for p in candidates:
                 if anchor is not None and p._p is anchor._p:
                     active = True
                     continue
-                if active and p.style.name == 'Quote':
+                if active and (p.style.name == 'Quote' or p.style.name.startswith('Heading')):
                     break
                 if active:
                     following.append(p)
@@ -288,16 +304,11 @@ def export_word_incremental(book, output, target=None, fresh=False):
         for record in records:
             marked_paragraph = marked(record['key'])
             if marked_paragraph is not None:
-                if marked_paragraph.paragraph_format.space_after != Pt(16.5):
-                    marked_paragraph.paragraph_format.space_after = Pt(16.5)
-                    changed = True
-                    spacing_adjusted += 1
                 retained += 1
                 continue
             existing = matching(record)
             if existing is not None:
-                spacing_adjusted += existing.paragraph_format.space_after != Pt(16.5)
-                existing.paragraph_format.space_after = Pt(16.5)
+                # 仅登记去重身份，不修改原文、字号、颜色、间距或其他已有排版。
                 mark(existing, record['key'])
                 retained += 1
                 changed = True

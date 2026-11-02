@@ -9,13 +9,17 @@ description: 从用户微信读书书架选书，导出按章节整理的划线�
 
 ## 交互与授权
 
-1. 所有书籍、日期和导出目标的提问只在 Codex 对话中完成。先执行独立的“微信读书授权”步骤，不能把选书、日期或 Notion 位置混在首次 Key 提问中。先检查 `auth status`；已有有效授权可说明已授权并继续，用户要求重新输入则按以下流程更新。
+首次授权必须明确问：“是否在这台电脑上长期记住微信读书 Key？1. 长期记住，加密保存在本机；2. 临时使用，仅缓存 30 分钟。”已有明确选择就沿用，不重复问；没有选择不能擅自假定临时或长期。长期保存不代表微信读书保证 Key 永久有效。旧版已有加密授权但 auth status.retention_choice_recorded=false 时补问一次；用 `auth retention --remember|--temporary` 修改现有可读取授权的保存偏好，无需重新索取 Key。已有明确选择且有效的授权无需每次再问。
+
+1. 所有书籍、日期和导出目标的提问只在 Codex 对话中完成。先执行独立的“微信读书授权”步骤，不能把选书、日期或 Notion 位置混在首次 Key 提问中。先检查 `auth status`；已有明确保存偏好的有效授权可说明已授权并继续，用户要求重新输入则按以下流程更新。
 2. 默认聊天输入 Key：提示“请发送官方 wrk- 开头的微信读书 Key，发送后回复‘确定’完成授权。”附官方页面 https://weread.qq.com/r/weread-skills 。首次简短说明 Key 会进入聊天历史，不要声称密码框、自动隐藏或自动删除。收到 Key 但尚无“确定”时，只回答“已收到 Key，请回复‘确定’继续。”不回显 Key，不请求书名，不调用接口或保存；新的 Key 替换旧的待确认值，取消则丢弃待确认值。可接受一条消息中 Key 加单独一行“确定”。只使用本次授权步骤收到的值，不复用历史消息中的旧凭证。
-3. 收到用户确认后，用后台 stdin 管道执行 `auth import --stdin --confirmed`，只将 Key 写入管道。用户明确要求记住授权才附加 `--remember`，否则 Windows DPAPI 加密缓存 30 分钟。不把 Key 放进命令行、shell 字符串、环境变量赋值命令或明文临时文件，不回显工具输入或原始输出。若后台命令工具无法写 stdin，可通过宿主已授权的 JavaScript/Node 执行工具导入 `../../scripts/auth_transport.mjs`，调用 `authorizeFromChat({python, launcher, key, confirmed: true, remember: false})`；该函数以 windowsHide、shell:false 子进程管道传递 Key，只返回授权摘要。遵守宿主执行权限；没有可用管道工具时说明能力限制，不退回终端输入或偷偷读取剪贴板。
+3. 用户确认且已选保存方式后，用后台 stdin 管道执行 `auth import --stdin --confirmed --remember`（长期）或 `--temporary`（临时），只将 Key 写入管道。必须明确选一，不能省略后静默采用默认。收到 retention_required 时只在对话中补问保存偏好。不把 Key 放进命令行、shell 字符串、环境变量赋值命令或明文临时文件，不回显工具输入或原始输出。若后台工具无法写 stdin，可通过宿主已授权的 JavaScript/Node 执行工具导入 `../../scripts/auth_transport.mjs`，调用 `authorizeFromChat({python, launcher, key, confirmed: true, remember: 用户明确选择的布尔值})`，不能硬编码 remember:false；该函数以 windowsHide、shell:false 子进程管道传递 Key，只返回授权摘要。遵守宿主执行权限；没有可用管道工具时说明能力限制，不退回终端输入或偷偷读取剪贴板。
 4. 授权接口验证与加密保存成功后，先说明“授权成功”，才开始后续选书与导出需求。失败只在此授权步骤说明并让用户重新输入；不能假装授权成功。剪贴板仅作为用户主动要求的可选方式：明确已复制并同意读取后才调用 `auth import --clipboard`，不能默认要求“复制后说已复制”。`auth forget` 清除加密记录；现有环境变量授权需由用户另行清除。DPAPI 绑定相同执行用户与电脑，解密失败时重新授权，不以明文回退。
 5. 已授权后后台运行 `shelf`。把真实书架书名、作者展示在对话中，保留 bookId 映射，用户只需选一次序号或关键词。用户已经点名的书能唯一匹配就直接使用；重名在对话中澄清。不得让用户在另一个窗口重复输入书名，不以笔记概览代替书架。
-6. 在对话中问 Word 还是 Notion，以及是否显示记录日期，已经给定的选项不重复问。Notion 必须区分：直接写入指定页面正文、在父页下另建子页、数据库新记录、私有新笔记。用户说“导入这个页面”默认指正文；不能自行建立子页。目标可为名称或 URL；名称须搜索并核对路径，重名再追问。
+6. 在对话中问 Word 还是 Notion，以及是否显示记录日期，已经给定的选项不重复问。Word 也必须单独问：“更新现有 Word 文件，还是在指定文件夹新建？”更新旧文件请用户提供或从已授权上下文确认具体 .docx 文件；新建请确认文件夹路径，文件名默认《书名》- 读书笔记.docx，重名自动另存不覆盖。明确说“上次那个文件”且能唯一定位时直接沿用，不能不问就按 bookId 自动选文件。目标或路径不明确时先在对话中澄清。Notion 必须区分直接写入页面、父页下另建子页、数据库新记录、私有新笔记；“导入这个页面”默认指正文。
 7. 在后台执行 `prepare --book-id <已选 bookId> --format word|notion --dates show|hide --output <用户输出目录>`。也支持 `--book-name <关键词>`，但已取得 ID 应使用 ID。shelf/prepare 不读 stdin；只有显式的 auth import --stdin 从宿主后台管道读取一次凭证，绝不终端提问。selection_required 表示应在对话中选书，auth_required 表示应在对话中处理授权。不要把非零返回码当作需要打开终端的理由。stderr 是进度，stdout 是结果 JSON；在对话中转述简洁进度和成功位置。不要把私密笔记发给第三方诊断服务。
+
+Word 调用必须带用户所选目标模式：现有文件用 `--word-mode existing --word-target <具体 .docx 路径>`；新建用 `--word-mode new --output <已确认文件夹>`。word_destination_required/word_folder_required/word_target_required 表示要在对话中补问，不是调用旧版终端向导的理由。原 Word 的文字、手写笔记、批注、图片、表格、字号、颜色和间距均保留；空行与样式只作用于本次新增内容，不给旧段落重排版。新建明确另存一份；更新旧文档只追加缺项并去重，先备份，不整份重建。
 
 如果执行沙箱无法访问 Windows 用户加密保护或剪贴板，使用宿主后台命令工具提供的本机用户权限流程，获准后重试，仍不开窗口。授权、doctor、shelf、prepare 应使用相同用户身份和状态目录；不能在两个身份间反复创建授权。宿主不允许本机权限时如实说明当前环境无法完成授权，不要求用户改回终端选书，也不把 Key 放进参数绕过保护。
 
@@ -37,7 +41,7 @@ description: 从用户微信读书书架选书，导出按章节整理的划线�
 
 成功后在用户输出目录保存导入回执，包含 plan fingerprint、目标 page_id、每条完成的 comment_id；不保存凭证。重试先核对回执和远端状态，避免重复追加或重复评论。报告部分失败并恢复未完成部分，不能自动重建整页。
 
-Word 也默认增量更新，遵循同一增量参考。目标文件有歧义时在对话中选定并传 --word-target；不会重复询问书名。明确另存全新文件才用 --sync-mode new。
+Word 只有在用户选择更新具体文件后才增量写入，遵循同一增量参考。目标文件有歧义时在对话中选定并传 --word-mode existing --word-target；不会重复询问书名。选择新建时用 --word-mode new --output <文件夹>。
 
 ## 完整性与更新
 
