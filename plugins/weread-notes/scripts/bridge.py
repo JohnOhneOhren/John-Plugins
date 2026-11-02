@@ -111,7 +111,7 @@ def main(argv=None):
     source = provision.add_mutually_exclusive_group(required=True)
     source.add_argument('--stdin', action='store_true', help='从后台进程输入管道读取聊天中已确认的 Key，不回显')
     source.add_argument('--clipboard', action='store_true', help='用户主动选择的兼容方式，不作为默认流程')
-    provision.add_argument('--confirmed', action='store_true', help='用户已在对话中发送“确定”，允许验证此 Key')
+    provision.add_argument('--confirmed', action='store_true', help=argparse.SUPPRESS)  # 兼容旧宿主调用，不再作为授权门槛。
     retention = provision.add_mutually_exclusive_group()
     retention.add_argument('--remember', action='store_true', help='用户明确选择长期记住授权')
     retention.add_argument('--temporary', action='store_true', help='用户明确选择临时授权，仅加密缓存 30 分钟')
@@ -164,9 +164,7 @@ def main(argv=None):
                     result = {'retention_updated': True, 'remembered': args.remember,
                               'expires_in_seconds': None if args.remember else 1800}
                 else:
-                    # 聊天输入必须先确认；不以命令行参数传 Key，不调用终端 input/getpass。
-                    if args.stdin and not args.confirmed:
-                        raise credentials.AuthError('confirmation_required', '已收到 Key，请用户回复“确定”后再验证授权。')
+                    # 收到本次 Key 且已选择保存方式即验证；不以参数传 Key，不调用终端 input/getpass。
                     if not args.remember and not args.temporary:
                         raise credentials.AuthError('retention_required', '请先询问用户：是否在这台电脑上长期记住微信读书 Key？选长期记住，或仅临时使用 30 分钟。')
                     key = sys.stdin.readline(8193).strip() if args.stdin else core.read_clipboard().strip()
@@ -243,7 +241,7 @@ def main(argv=None):
                           'message': str(exc), 'choices': exc.choices}, ensure_ascii=False))
         return 4
     except credentials.AuthError as exc:
-        print(json.dumps({'status': exc.code if exc.code in ('confirmation_required', 'retention_required') else 'auth_required',
+        print(json.dumps({'status': exc.code if exc.code == 'retention_required' else 'auth_required',
                           'code': exc.code, 'message': str(exc)}, ensure_ascii=False))
         return 3
     except Exception as exc:

@@ -26,7 +26,7 @@ def main():
     options = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
     managed = dependencies.managed_python()
     python = str(managed) if managed.is_file() else sys.executable
-    if (sys.argv[1:3] == ['auth', 'import'] and '--stdin' in sys.argv and '--confirmed' in sys.argv
+    if (sys.argv[1:3] == ['auth', 'import'] and '--stdin' in sys.argv
             and any(flag in sys.argv for flag in ('--remember', '--temporary'))):
         # 从宿主后台管道转交一次，绝不打开终端或把 Key 放入 argv。
         payload = sys.stdin.readline(8193).encode('utf-8')

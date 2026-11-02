@@ -1,5 +1,7 @@
 # 发布与兼容维护
 
+0.6.1 取消输入 Key 后的二次“确定”。CLI 不再要求 --confirmed，仍兼容旧参数；Node 适配器不再要求 confirmed 字段。保存偏好仍须明确，未选择时先返回 retention_required 且不读取 Key。用户只需发送本次 Key，已选保存方式即可直接验证并加密存储。旧版说明中的确认门槛由此替代。
+
 0.6.0 新增按导出方式执行的 preflight/setup。Notion 安装/连接状态由宿主工具检查后形成最小快照，未知、未连接、缺评论能力分别返回待处理状态，不能通过本地 notion-client 推断。setup 仅在用户状态目录补齐固定 Python 库，launch 后续自动复用隔离解释器。外部插件通过动态搜索和宿主建议入口安装，用户本人授权后复查；社区插件的依赖元数据可能无法被公共目录解析，因此仍保留实际搜索流程。没有向 plugin.json 添加未经支持的依赖字段。构建清单须包含 dependencies.py 与 dependencies.md。
 
 核心实现来源是仓库根目录 weread_notes.py，构建时同步到插件，不要分别修改两个副本。bridge.py 输出的 notion-plan schema_version=2，正文、稳定身份和评论分离。已有的单条点赞判断、严格章节关联、日期选择与精简版式均保留。

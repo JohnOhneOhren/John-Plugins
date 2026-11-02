@@ -86,24 +86,24 @@ class ChatFlowTests(unittest.TestCase):
             self.assertEqual(Path(second['path']).parent, Path(folder))
             self.assertEqual(Path(first['path']).read_bytes(), original)
 
-    def test_chat_key_requires_confirmation_before_read_or_request(self):
+    def test_chat_key_without_retention_does_not_read_or_request(self):
         class Unreadable:
             def readline(self, *args):
-                raise AssertionError('确认前不能读取 Key')
+                raise AssertionError('保存方式未选时不能读取 Key')
         with patch.object(sys, 'stdin', Unreadable()), patch.object(bridge.core, 'Weread') as client, \
                 patch.object(credentials, 'save_key') as save:
             code, result = run_bridge(['auth', 'import', '--stdin'])
         self.assertEqual(code, 3)
-        self.assertEqual(result['status'], 'confirmation_required')
+        self.assertEqual(result['status'], 'retention_required')
         client.assert_not_called()
         save.assert_not_called()
 
-    def test_confirmed_chat_key_uses_pipe_without_clipboard_or_book_prompt(self):
+    def test_chat_key_validates_immediately_without_second_confirmation(self):
         with patch.object(sys, 'stdin', io.StringIO('wrk-chat-test\n')), \
                 patch.object(bridge.core, 'read_clipboard', side_effect=AssertionError('默认不能读剪贴板')), \
                 patch.object(bridge.core, 'Weread') as client, patch.object(credentials, 'save_key') as save:
             client.return_value.shelf.return_value = BOOKS
-            code, result = run_bridge(['auth', 'import', '--stdin', '--confirmed', '--temporary'])
+            code, result = run_bridge(['auth', 'import', '--stdin', '--temporary'])
         self.assertEqual(code, 0)
         self.assertTrue(result['authorized'])
         self.assertNotIn('books', result)
@@ -114,7 +114,7 @@ class ChatFlowTests(unittest.TestCase):
         fake = 'invalid-private-fixture'
         with tempfile.TemporaryDirectory() as folder:
             run = subprocess.run([sys.executable, str(ROOT / 'plugins/weread-notes/scripts/launch.py'),
-                                  'auth', 'import', '--stdin', '--confirmed', '--temporary'], input=fake + '\n',
+                                  'auth', 'import', '--stdin', '--temporary'], input=fake + '\n',
                                  env={**os.environ, 'WEREAD_NOTES_STATE_DIR': folder},
                                  capture_output=True, encoding='utf-8')
         self.assertEqual(run.returncode, 1)
@@ -131,18 +131,16 @@ class ChatFlowTests(unittest.TestCase):
                 'print(json.dumps({"authorized":key=="wrk-fake-transport" and any(a in sys.argv for a in ("--remember","--temporary")) and not any("wrk-" in a for a in sys.argv),'
                 '"remembered":"--remember" in sys.argv}))\n', encoding='utf-8')
             program = ('import {authorizeFromChat} from ' + json.dumps(module) + ';'
-                       'const pending=await authorizeFromChat({python:"missing",launcher:"missing",key:"wrk-fake-transport"});'
-                       'const undecided=await authorizeFromChat({python:"missing",launcher:"missing",key:"wrk-fake-transport",confirmed:true});'
+                       'const undecided=await authorizeFromChat({python:"missing",launcher:"missing",key:"wrk-fake-transport"});'
                        'const result=await authorizeFromChat({python:process.argv[1],launcher:process.argv[2],'
-                       'key:"wrk-fake-transport",confirmed:true,remember:true});'
+                       'key:"wrk-fake-transport",remember:true});'
                        'const temporary=await authorizeFromChat({python:process.argv[1],launcher:process.argv[2],'
-                       'key:"wrk-fake-transport",confirmed:true,remember:false});'
-                       'console.log(JSON.stringify({pending,undecided,result,temporary}));')
+                       'key:"wrk-fake-transport",remember:false});'
+                       'console.log(JSON.stringify({undecided,result,temporary}));')
             run = subprocess.run([shutil.which('node'), '--input-type=module', '-e', program,
                                   sys.executable, str(fake_launcher)], capture_output=True, encoding='utf-8')
         self.assertEqual(run.returncode, 0, run.stderr)
         result = json.loads(run.stdout)
-        self.assertEqual(result['pending']['status'], 'confirmation_required')
         self.assertEqual(result['undecided']['status'], 'retention_required')
         self.assertTrue(result['result']['authorized'])
         self.assertTrue(result['result']['remembered'])

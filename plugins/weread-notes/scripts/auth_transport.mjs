@@ -3,13 +3,12 @@
  */
 import { spawn } from 'node:child_process';
 
-export async function authorizeFromChat({ python, launcher, key, confirmed = false, remember }) {
-  if (!confirmed) return { status: 'confirmation_required', code: 'confirmation_required' };
+export async function authorizeFromChat({ python, launcher, key, remember }) {
   if (typeof remember !== 'boolean') return { status: 'retention_required', code: 'retention_required' };
   if (typeof key !== 'string' || !key.startsWith('wrk-') || key.length <= 4 || key.length > 8192 || /\s/.test(key)) {
     return { error: 'Key 格式不正确，请只发送官方 wrk- Key。' };
   }
-  const args = [launcher, 'auth', 'import', '--stdin', '--confirmed'];
+  const args = [launcher, 'auth', 'import', '--stdin'];
   args.push(remember ? '--remember' : '--temporary');
   return await new Promise(resolve => {
     const child = spawn(python, args, { shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
