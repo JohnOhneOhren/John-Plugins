@@ -285,7 +285,8 @@ class Weread:
     def __init__(self, cookie: str = "", api_key: str = "", max_pages: int = 1000,
                  interactive_auth: bool = False, personal_only: bool = False, show_dates: bool = False,
                  liked_source: str = "paragraphs", review_ids: list[str] | None = None,
-                 max_review_checks: int = 0, max_review_ranges: int = 500):
+                 max_review_checks: int = 0, max_review_ranges: int = 500,
+                 review_batch_size: int = 5):
         self.cookie, self.vid = parse_cookie(cookie) if cookie else ("", "")
         self.api_key, self.max_pages = api_key, max_pages
         self.interactive_auth = interactive_auth
@@ -293,6 +294,9 @@ class Weread:
         self.show_dates = show_dates
         self.liked_source, self.review_ids = liked_source, review_ids or []
         self.max_review_checks, self.max_review_ranges = max_review_checks, max_review_ranges
+        if not 1 <= review_batch_size <= 20:
+            raise ExportError("段落批量大小必须在 1 到 20 之间。")
+        self.review_batch_size = review_batch_size
         self.last_liked_scan = {}
         self.cookie_policy = DefaultCookiePolicy()
         self.cookiejar = CookieJar(policy=self.cookie_policy)
@@ -625,6 +629,7 @@ class Weread:
         ranges: dict[tuple[str, str], dict] = {}
         failed = 0
         page_count = 0
+        range_requests = 0
         visited_ranges, completed_ranges = set(), set()
         scheduled_count = 0
         pending_pages = False
@@ -690,6 +695,10 @@ class Weread:
             if scheduled_count < len(ranges):
                 warnings.append(f'原文范围上限：已安排 {scheduled_count}/{len(ranges)} 个范围，其余未扫描。')
             queue = deque((key, context, {'maxIdx': 0, 'synckey': 0}, set()) for key, context in scheduled)
+            # 预读同章范围；队列仍按原顺序消费，每个范围保留自己的游标和校验。
+            # 缓存仅存在于本次抓取，绝不复用旧的点赞状态。
+            cached_pages = {}
+            batch_enabled = True
             while queue and page_count < self.max_pages:
                 (uid, span), context, cursor, seen = queue.popleft()
                 visited_ranges.add((uid, span))
@@ -697,8 +706,42 @@ class Weread:
                     print(f'  已访问 {len(visited_ranges)}/{scheduled_count} 个原文范围，已读取 {page_count} 页，发现 {len(candidates)} 条候选想法…')
                 page_count += 1
                 try:
-                    data = self.request("/book/readreviews", {"bookId": bid, "chapterUid": number(uid),
-                        "reviews": [{"range": span, "count": 20, **cursor}]}, agent=True)
+                    cache_key = (uid, span, json.dumps(cursor, sort_keys=True))
+                    if cache_key not in cached_pages and batch_enabled:
+                        batch = [(span, cursor)]
+                        # 已缓存的页也占用剩余预算，不能因预读突破原页数上限。
+                        budget = self.max_pages - page_count + 1 - len(cached_pages)
+                        for (other_uid, other_span), _, other_cursor, _ in queue:
+                            other_key = (other_uid, other_span, json.dumps(other_cursor, sort_keys=True))
+                            if len(batch) >= min(self.review_batch_size, budget):
+                                break
+                            if other_uid == uid and other_key not in cached_pages:
+                                batch.append((other_span, other_cursor))
+                        if len(batch) > 1:
+                            try:
+                                range_requests += 1
+                                response = self.request('/book/readreviews', {
+                                    'bookId': bid, 'chapterUid': number(uid),
+                                    'reviews': [{'range': s, 'count': 20, **c} for s, c in batch]}, agent=True)
+                                groups = response.get('reviews', [])
+                                if not isinstance(groups, list):
+                                    raise ExportError('批量段落响应缺少 reviews。')
+                                for s, c in batch:
+                                    matches = [g for g in groups if isinstance(g, dict) and str(g.get('range')) == s]
+                                    if len(matches) == 1 and isinstance(matches[0].get('pageReviews'), list):
+                                        cached_pages[(uid, s, json.dumps(c, sort_keys=True))] = matches[0]
+                                    else:
+                                        batch_enabled = False
+                            except ExportError:
+                                batch_enabled = False
+                            if not batch_enabled:
+                                print('  批量段落查询不完整，已自动切换单条查询。')
+                    if cache_key in cached_pages:
+                        data = {'reviews': [cached_pages.pop(cache_key)]}
+                    else:
+                        range_requests += 1
+                        data = self.request("/book/readreviews", {"bookId": bid, "chapterUid": number(uid),
+                            "reviews": [{"range": span, "count": 20, **cursor}]}, agent=True)
                     groups = data.get("reviews")
                     if not isinstance(groups, list):
                         raise ExportError("段落想法响应缺少 reviews。")
@@ -797,6 +840,7 @@ class Weread:
             raise ExportError(f"读者想法扫描有 {failed} 处读取失败，未能核验任何候选想法，不能将此结果视为没有点赞记录。")
         print(f"  已核验 {verified} 条想法：已点赞 {len(result)} 条，未点赞 {unliked} 条，状态未知 {unknown} 条。")
         self.last_liked_scan = {'scope': self.liked_source, 'known_ranges': len(ranges),
+                               'range_requests': range_requests, 'range_batch_size': self.review_batch_size,
                                'scheduled_ranges': scheduled_count, 'visited_ranges': len(visited_ranges),
                                'completed_ranges': len(completed_ranges), 'pages_read': page_count,
                                'discovered_candidates': len(candidates), 'selected_candidates': len(selected),

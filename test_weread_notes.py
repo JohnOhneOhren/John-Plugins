@@ -367,6 +367,61 @@ class LikedThoughtTests(unittest.TestCase):
         self.assertEqual(client.cookie, "")
 
 
+class BatchedDiscoveryTests(unittest.TestCase):
+    def run_scan(self, *, partial=False, reject=False, pages=100, pagination=False):
+        client = w.Weread(api_key='wrk-test', max_pages=pages)
+        requests = []
+        def request(path, params=None, **kwargs):
+            if path == '/book/bestbookmarks':
+                return {'items': [{'chapterUid': 1, 'range': f'{i}-{i+1}'} for i in range(5)]}
+            if path == '/book/underlines':
+                return {'underlines': []}
+            if path == '/book/readreviews':
+                batch = params['reviews']
+                requests.append(batch)
+                if reject and len(batch) > 1:
+                    raise w.ExportError('unsupported')
+                if partial and len(batch) > 1:
+                    batch = batch[:1]
+                return {'reviews': [dict(range=p['range'], hasMore=int(pagination and p['maxIdx'] == 0),
+                    maxIdx=1, synckey=1, pageReviews=[{'reviewId': '456_r' + p['range'].split('-')[0]
+                    + ('x' if p['maxIdx'] else ''), 'content': 'reader'}]) for p in reversed(batch)]}
+            rid = params['reviewId']
+            return {'reviewId': rid, 'review': {'bookId': 'b', 'content': 'reader', 'isLike': 1}}
+        client.request = request
+        with contextlib.redirect_stdout(io.StringIO()):
+            rows, _ = client.liked_thoughts('b', [{'chapterUid': 1}], [], set())
+        return rows, client.last_liked_scan, requests
+
+    def test_batch_reduces_requests_without_skipping_details(self):
+        rows, stats, requests = self.run_scan()
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(stats['range_requests'], 1)
+        self.assertEqual(stats['verified_candidates'], 5)
+
+    def test_partial_and_rejected_batches_fall_back_without_loss(self):
+        for mode in ('partial', 'reject'):
+            rows, stats, requests = self.run_scan(**{mode: True})
+            self.assertEqual(len(rows), 5)
+            self.assertEqual(sum(len(b) > 1 for b in requests), 1)
+            self.assertEqual(stats['completed_ranges'], 5)
+
+    def test_batch_preserves_page_budget(self):
+        rows, stats, requests = self.run_scan(pages=2)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sum(len(b) for b in requests), 2)
+        self.assertEqual(stats['pages_read'], 2)
+        self.assertTrue(stats['pending_pages'])
+
+    def test_batch_keeps_independent_pagination_and_matches_by_range(self):
+        rows, stats, requests = self.run_scan(pagination=True)
+        self.assertEqual(len(rows), 10)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(stats['completed_ranges'], 5)
+        self.assertEqual([p['maxIdx'] for p in requests[1]], [1] * 5)
+
+
 class ReviewProbeTests(unittest.TestCase):
     def test_reference_requires_review_id_not_book_hash(self):
         self.assertEqual(w.review_id_from_reference("123_Ab-c"), "123_Ab-c")
