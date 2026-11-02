@@ -245,6 +245,8 @@ class LikedThoughtTests(unittest.TestCase):
         def request(path, params=None, **kwargs):
             if path == "/book/bestbookmarks":
                 return {"items": [{"chapterUid": 1, "range": "1-10"}]}
+            if path == '/book/underlines':
+                return {'underlines': []}
             if path == "/book/readreviews":
                 rows = [{"reviewId": f"456_r{i}", "review": {"isLike": int(i == 4)}} for i in range(5)]
                 return {"reviews": [{"range": "1-10", "hasMore": 0, "pageReviews": rows}]}
@@ -316,6 +318,8 @@ class LikedThoughtTests(unittest.TestCase):
             if path == "/book/bestbookmarks":
                 self.assertIs(type(params["chapterUid"]), int)
                 return {"items": [{"chapterUid": 1, "range": "10-20", "markText": "excerpt"}]}
+            if path == '/book/underlines':
+                return {'underlines': []}
             if path == "/book/readreviews":
                 cursor = params["reviews"][0]["maxIdx"]
                 return {"reviews": [{"range": "10-20", "pageReviews": [

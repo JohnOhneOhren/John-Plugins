@@ -81,6 +81,8 @@ def connector_plan(book, sync_mode='incremental'):
     plan = {'schema_version': 2, 'book_id': book.book_id, 'title': book.title + ' 读书笔记',
             'content': '\n\n'.join(parts), 'comments': comments, 'warnings': core.concise_notices(book.warnings),
             'sync_mode': sync_mode, 'records': records}
+    if book.liked_scan:
+        plan['liked_scan'] = book.liked_scan
     plan['fingerprint'] = hashlib.sha256(json.dumps(plan, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     return plan
 
@@ -127,8 +129,11 @@ def main(argv=None):
     prep.add_argument('--sync-mode', choices=['incremental', 'new'], default='incremental')
     prep.add_argument('--word-target', type=Path)
     prep.add_argument('--word-mode', choices=['existing', 'new'], help='Word 需先在对话中选择更新旧文件或在指定文件夹新建')
-    prep.add_argument('--max-review-checks', type=int, default=200)
+    prep.add_argument('--max-review-checks', type=int, default=0, help='0 核验全部已发现候选；正数为用户选择的限额')
     prep.add_argument('--max-review-ranges', type=int, default=500)
+    prep.add_argument('--max-review-pages', type=int, default=1000)
+    prep.add_argument('--review-id', action='append', default=[], help='优先核验用户提供的想法 ID 或详情链接')
+    prep.add_argument('--liked-source', choices=['paragraphs', 'links'], default='paragraphs')
     args = parser.parse_args(argv)
     try:
         with contextlib.redirect_stdout(sys.stderr):
@@ -196,15 +201,25 @@ def main(argv=None):
                         raise incremental.SyncError('word_destination_conflict', '新建 Word 请选择目标文件夹，不要同时指定现有文件。')
                     elif args.output.exists() and not args.output.is_dir():
                         raise incremental.SyncError('word_folder_required', '新建位置应是文件夹，而不是文件。')
-                if args.command == 'prepare' and min(args.max_review_checks, args.max_review_ranges) < 1:
-                    raise core.ExportError('扫描上限必须大于 0。')
+                if args.command == 'prepare':
+                    if args.max_review_checks < 0 or min(args.max_review_ranges, args.max_review_pages) < 1:
+                        raise core.ExportError('核验上限可为 0（核验全部候选），页数与范围上限必须大于 0。')
+                    for reference in args.review_id:
+                        core.review_id_from_reference(reference)
+                    if args.liked_source == 'links' and not args.review_id:
+                        raise core.ExportError('链接模式需要至少一个 --review-id。')
+                    if args.personal_only and args.review_id:
+                        raise core.ExportError('仅个人笔记模式不能同时核验读者想法链接。')
                 if args.command == 'prepare' and args.demo:
                     book = core.demo_book(ZoneInfo('Asia/Shanghai'))
                 else:
                     key = credentials.get_key()
                     client = core.Weread(api_key=key, interactive_auth=False,
                                          personal_only=getattr(args, 'personal_only', False),
-                                         max_review_checks=getattr(args, 'max_review_checks', 200),
+                                         max_review_checks=getattr(args, 'max_review_checks', 0),
+                                         max_pages=getattr(args, 'max_review_pages', 1000),
+                                         review_ids=getattr(args, 'review_id', []),
+                                         liked_source=getattr(args, 'liked_source', 'paragraphs'),
                                          max_review_ranges=getattr(args, 'max_review_ranges', 500))
                     shelf = client.shelf()
                     if args.command == 'shelf':
@@ -227,6 +242,11 @@ def main(argv=None):
                         result = {'path': str(path.resolve()), 'fingerprint': plan['fingerprint'],
                                   'comments': len(plan['comments'])}
                     result['warnings'] = core.concise_notices(book.warnings)
+                    if book.liked_scan:
+                        result['liked_scan'] = book.liked_scan
+                        report_path = args.output / (core.safe_filename(book.book_id) + '.liked-scan.json')
+                        core.atomic_json(report_path, book.liked_scan)
+                        result['liked_scan_report'] = str(report_path.resolve())
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except (KeyboardInterrupt, EOFError):

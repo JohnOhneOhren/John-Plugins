@@ -172,6 +172,33 @@ class ChatFlowTests(unittest.TestCase):
     def test_unique_keyword_selects_without_prompt(self):
         self.assertEqual(bridge.select_for_chat(BOOKS, book_name='玩笑')['bookId'], '1')
 
+    def test_liked_scan_defaults_and_explicit_reference_reach_client(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'WEREAD_API_KEY': 'wrk-fake-test'}), \
+                patch.object(bridge.core, 'Weread') as client:
+            client.return_value.shelf.return_value = BOOKS
+            client.return_value.collect.return_value = bridge.core.demo_book(bridge.ZoneInfo('Asia/Shanghai'))
+            code, _ = run_bridge(['prepare', '--book-id', '1', '--format', 'notion', '--dates', 'hide',
+                                  '--review-id', '456_fixture', '--output', folder])
+        self.assertEqual(code, 0)
+        self.assertEqual(client.call_args.kwargs['max_review_checks'], 0)
+        self.assertEqual(client.call_args.kwargs['review_ids'], ['456_fixture'])
+
+    def test_liked_coverage_report_is_returned_and_saved_without_private_content(self):
+        report = {'known_ranges': 50, 'completed_ranges': 20, 'discovered_candidates': 1200,
+                  'verified_candidates': 200, 'unchecked_candidates': 1000, 'full_book_complete': False}
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'WEREAD_API_KEY': 'wrk-fake-test'}), \
+                patch.object(bridge.core, 'Weread') as client:
+            client.return_value.shelf.return_value = BOOKS
+            book = bridge.core.demo_book(bridge.ZoneInfo('Asia/Shanghai'))
+            book.liked_scan = report
+            client.return_value.collect.return_value = book
+            code, result = run_bridge(['prepare', '--book-id', '1', '--format', 'notion', '--dates', 'hide',
+                                       '--output', folder])
+            self.assertEqual(code, 0)
+            self.assertEqual(result['liked_scan'], report)
+            self.assertEqual(json.loads(Path(result['liked_scan_report']).read_text(encoding='utf-8')), report)
+            self.assertEqual(json.loads(Path(result['path']).read_text(encoding='utf-8'))['liked_scan'], report)
+
     def test_exact_title_preferred_over_partial_matches(self):
         books = BOOKS + [{'bookId': '3', 'title': '不开玩笑续篇'}]
         self.assertEqual(bridge.select_for_chat(books, book_name='不开玩笑')['bookId'], '1')

@@ -19,7 +19,7 @@ import re
 import sys
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
@@ -285,7 +285,7 @@ class Weread:
     def __init__(self, cookie: str = "", api_key: str = "", max_pages: int = 1000,
                  interactive_auth: bool = False, personal_only: bool = False, show_dates: bool = False,
                  liked_source: str = "paragraphs", review_ids: list[str] | None = None,
-                 max_review_checks: int = 200, max_review_ranges: int = 500):
+                 max_review_checks: int = 0, max_review_ranges: int = 500):
         self.cookie, self.vid = parse_cookie(cookie) if cookie else ("", "")
         self.api_key, self.max_pages = api_key, max_pages
         self.interactive_auth = interactive_auth
@@ -293,6 +293,7 @@ class Weread:
         self.show_dates = show_dates
         self.liked_source, self.review_ids = liked_source, review_ids or []
         self.max_review_checks, self.max_review_ranges = max_review_checks, max_review_ranges
+        self.last_liked_scan = {}
         self.cookie_policy = DefaultCookiePolicy()
         self.cookiejar = CookieJar(policy=self.cookie_policy)
         self._seeded_cookies = {}
@@ -599,15 +600,17 @@ class Weread:
             warnings.append("部分候选观点未收录：" + "；".join(f"{key} {value} 条" for key, value in excluded.items()) + "。")
         if public and not own_vid and not mine_ids_complete:
             warnings.append("当前账号身份无法确认且个人想法缺少 ID，为避免混入本人评论，未收录读者观点。")
-        return build_notebook({**book, **info, "bookId": bid}, chapters,
-                              highlights, mine, liked, timezone, warnings, show_dates=self.show_dates)
+        notebook = build_notebook({**book, **info, "bookId": bid}, chapters,
+                                  highlights, mine, liked, timezone, warnings, show_dates=self.show_dates)
+        notebook.liked_scan = {**self.last_liked_scan, 'exported_liked': len(liked)} if self.last_liked_scan else {}
+        return notebook
 
     def liked_thoughts(self, bid: str, chapters: list[dict], highlights: list[dict],
                       own_ids: set[str]) -> tuple[list[dict], list[str]]:
         """发现候选后逐条用官方 single 核验，范围有限，始终写明覆盖边界。
 
-        分享链接优先，不依赖热门排名；自动发现来自自己的划线以及各章 TOP20。
-        TOP20 之外、没有已知 range 的段落不会被假装已扫描。
+        分享链接优先；自动发现包含章节划线位置，不再只依赖热门 TOP20。
+        按章节轮询范围并轮询分页，避免早期热门段落耗尽全部发现预算。
         """
         candidates: dict[str, dict] = {}
         warnings = []
@@ -617,18 +620,21 @@ class Weread:
             rid = review_id_from_reference(reference)
             candidates.setdefault(rid, {})
             priorities[rid] = 0
-        if len(candidates) > self.max_review_checks:
+        if self.max_review_checks and len(candidates) > self.max_review_checks:
             raise ExportError("提供的想法链接数超过 --max-review-checks，请提高上限或分批验证。")
         ranges: dict[tuple[str, str], dict] = {}
-        discovery_limit = self.max_review_checks * 5
         failed = 0
+        page_count = 0
+        visited_ranges, completed_ranges = set(), set()
+        scheduled_count = 0
+        pending_pages = False
         def add_range(row):
             uid, span = str(row.get("chapterUid", "")), str(row.get("range") or "")
             if uid and re.fullmatch(r"\d+-\d+", span):
                 ranges.setdefault((uid, span), {"abstract": clean(row.get("markText") or row.get("abstract")), "chapterUid": uid, "range": span})
         seed_details = {}
         if self.liked_source == "paragraphs":
-            warnings.append("读者观点仅覆盖个人笔记、指定链接及各章热门划线中可定位的段落，不代表全书完整点赞记录。")
+            warnings.append("读者观点仅覆盖个人笔记、指定链接、热门划线及章节划线位置中可定位的段落，不代表全书完整点赞记录。")
             # 用户给出的链接也是原文定位入口，可补充热门 TOP20 之外的段落。
             for rid in candidates:
                 if rid in own_ids:
@@ -652,9 +658,6 @@ class Weread:
                 if not uid or uid in seen_chapters:
                     continue
                 seen_chapters.add(uid)
-                if len(ranges) >= self.max_review_ranges:
-                    warnings.append("段落扫描达到本次上限，剩余章节未扫描。")
-                    break
                 print(f"  正在查找第 {len(seen_chapters)} 个章节中的读者想法…")
                 try:
                     data = self.request("/book/bestbookmarks", {"bookId": bid, "chapterUid": number(uid)}, agent=True)
@@ -665,80 +668,93 @@ class Weread:
                             add_range({**item, "chapterUid": item.get("chapterUid", uid)})
                 except ExportError:
                     failed += 1
-            page_count = 0
-            for index, ((uid, span), context) in enumerate(ranges.items()):
-                if index >= self.max_review_ranges or len(candidates) >= discovery_limit:
-                    warnings.append("候选想法或段落扫描达到本次上限，仍可能有未发现的点赞内容。")
-                    break
-                if index % 10 == 0:
-                    print(f"  正在读取原文范围 {index + 1}/{min(len(ranges), self.max_review_ranges)}，已发现 {len(candidates)} 条候选想法…")
-                cursor, seen = {"maxIdx": 0, "synckey": 0}, set()
-                for _ in range(self.max_pages):
-                    if page_count >= self.max_pages:
-                        warnings.append("读者想法扫描达到请求页数上限，本次结果不完整。")
-                        break
-                    page_count += 1
-                    try:
-                        data = self.request("/book/readreviews", {"bookId": bid, "chapterUid": number(uid),
-                            "reviews": [{"range": span, "count": 20, **cursor}]}, agent=True)
-                        groups = data.get("reviews")
-                        if not isinstance(groups, list):
-                            raise ExportError("段落想法响应缺少 reviews。")
-                        matches = [r for r in groups if isinstance(r, dict) and str(r.get("range")) == span]
-                        if len(matches) != 1 or not isinstance(matches[0].get("pageReviews"), list):
-                            raise ExportError("段落想法响应未包含对应 range。")
-                        group = matches[0]
-                        rows = group["pageReviews"]
-                        if "hasMore" not in group and number(group.get("totalCount"), -1) > len(rows):
-                            raise ExportError("段落想法有更多记录，但缺少分页标记。")
-                        signature = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
-                        if signature in seen:
-                            raise ExportError("段落想法分页重复。")
-                        seen.add(signature)
-                        for entry in rows:
-                            if not isinstance(entry, dict):
-                                continue
-                            row = unwrap_review(entry)
-                            rid = str(row.get("reviewId") or "")
-                            if rid and rid not in own_ids:
-                                metadata = {k: row[k] for k in ("chapterUid", "chapterName", "range", "abstract", "author", "userVid", "likesCount", "likeCount") if k in row}
-                                detail_context = merge_review_context(context, metadata)
-                                candidates[rid] = merge_review_context(detail_context, candidates.get(rid, {}))
-                                # 列表状态只影响核验顺序，绝不用于认定已点赞；每条仍查询 single。
-                                hint = like_state(row, official_detail=True)
-                                priority = 1 if hint is True else 3 if hint is False else 2
-                                priorities[rid] = min(priorities.get(rid, priority), priority)
-                                if len(candidates) >= discovery_limit:
-                                    warnings.append("候选想法达到本次上限，部分内容可能未扫描。")
-                                    break
-                        if str(group.get("hasMore", 0)).lower() not in ("1", "true"):
-                            break
+                try:
+                    data = self.request('/book/underlines', {'bookId': bid, 'chapterUid': number(uid), 'synckey': 0}, agent=True)
+                    if not isinstance(data.get('underlines'), list):
+                        raise ExportError('章节划线位置响应缺少 underlines。')
+                    for item in data['underlines']:
+                        if isinstance(item, dict):
+                            add_range({**item, 'chapterUid': uid})
+                except ExportError:
+                    failed += 1
+            # 先让每章的各范围轮流获得名额，再让每个范围轮流翻页。
+            chapter_ranges = defaultdict(deque)
+            for key, context in ranges.items():
+                chapter_ranges[key[0]].append((key, context))
+            scheduled = []
+            while any(chapter_ranges.values()) and len(scheduled) < self.max_review_ranges:
+                for group in chapter_ranges.values():
+                    if group and len(scheduled) < self.max_review_ranges:
+                        scheduled.append(group.popleft())
+            scheduled_count = len(scheduled)
+            if scheduled_count < len(ranges):
+                warnings.append(f'原文范围上限：已安排 {scheduled_count}/{len(ranges)} 个范围，其余未扫描。')
+            queue = deque((key, context, {'maxIdx': 0, 'synckey': 0}, set()) for key, context in scheduled)
+            while queue and page_count < self.max_pages:
+                (uid, span), context, cursor, seen = queue.popleft()
+                visited_ranges.add((uid, span))
+                if page_count % 10 == 0:
+                    print(f'  已访问 {len(visited_ranges)}/{scheduled_count} 个原文范围，已读取 {page_count} 页，发现 {len(candidates)} 条候选想法…')
+                page_count += 1
+                try:
+                    data = self.request("/book/readreviews", {"bookId": bid, "chapterUid": number(uid),
+                        "reviews": [{"range": span, "count": 20, **cursor}]}, agent=True)
+                    groups = data.get("reviews")
+                    if not isinstance(groups, list):
+                        raise ExportError("段落想法响应缺少 reviews。")
+                    matches = [r for r in groups if isinstance(r, dict) and str(r.get("range")) == span]
+                    if len(matches) != 1 or not isinstance(matches[0].get("pageReviews"), list):
+                        raise ExportError("段落想法响应未包含对应 range。")
+                    group = matches[0]
+                    rows = group["pageReviews"]
+                    if "hasMore" not in group and number(group.get("totalCount"), -1) > len(rows):
+                        raise ExportError("段落想法有更多记录，但缺少分页标记。")
+                    signature = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+                    if signature in seen:
+                        raise ExportError("段落想法分页重复。")
+                    seen.add(signature)
+                    for entry in rows:
+                        if not isinstance(entry, dict):
+                            continue
+                        row = unwrap_review(entry)
+                        rid = str(row.get("reviewId") or "")
+                        if rid and rid not in own_ids:
+                            metadata = {k: row[k] for k in ("chapterUid", "chapterName", "range", "abstract", "author", "userVid", "likesCount", "likeCount") if k in row}
+                            detail_context = merge_review_context(context, metadata)
+                            candidates[rid] = merge_review_context(detail_context, candidates.get(rid, {}))
+                            # 列表状态只影响核验顺序，绝不用于认定已点赞；每条仍查询 single。
+                            hint = like_state(row, official_detail=True)
+                            priority = 1 if hint is True else 3 if hint is False else 2
+                            priorities[rid] = min(priorities.get(rid, priority), priority)
+                    if str(group.get("hasMore", 0)).lower() not in ("1", "true"):
+                        completed_ranges.add((uid, span))
+                    else:
                         next_cursor = {k: group.get(k, cursor[k]) for k in cursor}
                         if next_cursor == cursor or not rows:
                             raise ExportError("段落想法分页游标停滞。")
-                        if len(candidates) >= discovery_limit:
-                            warnings.append("候选想法达到本次上限，部分内容未扫描。")
-                            break
-                        cursor = next_cursor
-                    except ExportError:
-                        failed += 1
-                        break
+                        queue.append(((uid, span), context, next_cursor, seen))
+                except ExportError:
+                    failed += 1
+            pending_pages = bool(queue)
+            if pending_pages:
+                warnings.append(f'读者想法请求页数达到 {self.max_pages} 页上限，仍有范围未读完。')
         else:
             if not candidates:
                 raise ExportError("链接模式需要至少一个 --review-id 想法链接或 ID。")
             warnings.append("读者观点仅核验本次提供的想法链接，未扫描全书其他点赞记录。")
         result, unknown, unliked, verified = [], 0, 0, 0
         ordered = sorted(candidates.items(), key=lambda item: priorities.get(item[0], 2))
-        if len(ordered) > self.max_review_checks:
+        if self.max_review_checks and len(ordered) > self.max_review_checks:
             warnings.append(f"发现 {len(ordered)} 条候选想法，本次仅核验前 {self.max_review_checks} 条，仍可能遗漏；可提高 --max-review-checks。")
         print(f"  共发现 {len(candidates)} 条候选想法；指定链接优先，其次核验列表提示已点赞的内容。")
-        for index, (rid, context) in enumerate(ordered[:self.max_review_checks]):
+        selected = ordered[:self.max_review_checks] if self.max_review_checks else ordered
+        for index, (rid, context) in enumerate(selected):
             if rid in own_ids:
                 if rid in explicit_ids:
                     print(f"  指定想法 {rid} 未收录：个人笔记接口将其列为本人内容。")
                 continue
             if index % 10 == 0:
-                print(f"  正在逐条核验点赞状态 {index + 1}/{min(len(candidates), self.max_review_checks)}…")
+                print(f"  正在逐条核验点赞状态 {index + 1}/{len(selected)}…")
             try:
                 data = seed_details[rid] if rid in seed_details else self.request("/review/single", {"reviewId": rid}, agent=True)
                 row = unwrap_review_detail(data)
@@ -780,6 +796,19 @@ class Weread:
         if failed and not verified:
             raise ExportError(f"读者想法扫描有 {failed} 处读取失败，未能核验任何候选想法，不能将此结果视为没有点赞记录。")
         print(f"  已核验 {verified} 条想法：已点赞 {len(result)} 条，未点赞 {unliked} 条，状态未知 {unknown} 条。")
+        self.last_liked_scan = {'scope': self.liked_source, 'known_ranges': len(ranges),
+                               'scheduled_ranges': scheduled_count, 'visited_ranges': len(visited_ranges),
+                               'completed_ranges': len(completed_ranges), 'pages_read': page_count,
+                               'discovered_candidates': len(candidates), 'selected_candidates': len(selected),
+                               'verified_candidates': verified, 'unchecked_candidates': len(ordered) - len(selected),
+                               'confirmed_liked': len(result), 'unliked': unliked, 'unknown': unknown,
+                               'failed_requests': failed, 'pending_pages': pending_pages,
+                               'complete_within_known_ranges': self.liked_source == 'paragraphs' and
+                                   len(completed_ranges) == len(ranges) and not failed and not unknown and
+                                   len(selected) == len(ordered),
+                               'full_book_complete': False}
+        print(f'  范围统计：读完 {len(completed_ranges)}/{len(ranges)} 个已知范围，'
+              f'核验 {verified}/{len(candidates)} 条候选；这不是全书点赞清单。')
         return unique_rows(result, "reviewId"), list(dict.fromkeys(warnings))
 
     def highlights(self, bid: str, *, agent: bool = False) -> tuple[list[dict], dict]:
@@ -909,6 +938,7 @@ class Notebook:
     chapters: list[Chapter]
     warnings: list[str] = field(default_factory=list)
     show_dates: bool = False
+    liked_scan: dict = field(default_factory=dict)
 
 
 def position(value: str) -> int:
@@ -1616,7 +1646,7 @@ def main() -> int:
                         help="读者观点来源：paragraphs 自动扫描可发现段落；links 仅核验指定链接")
     parser.add_argument("--review-id", action="append", default=[], metavar="ID_OR_URL",
                         help="优先核验的想法 ID 或链接，可重复；仅收录仍由当前账号点赞且属于所选书籍的想法")
-    parser.add_argument("--max-review-checks", type=int, default=200, help="官方单条想法核验上限，默认 200")
+    parser.add_argument("--max-review-checks", type=int, default=0, help="官方单条核验上限，默认 0 核验全部已发现候选；正数为用户选择的限额")
     parser.add_argument("--max-review-ranges", type=int, default=500, help="自动扫描原文范围上限，默认 500")
     dates = parser.add_mutually_exclusive_group()
     dates.add_argument("--show-dates", dest="show_dates", action="store_true", help="在正文后标注简短日期，如（2026-10-28）")
@@ -1627,8 +1657,8 @@ def main() -> int:
     parser.add_argument("--min-likes", type=int, default=0, help="已点赞评论的额外点赞数门槛，默认不设门槛")
     parser.add_argument("--max-pages", type=int, default=1000, help="翻页保护上限，达到时明确报错")
     args = parser.parse_args()
-    if args.min_likes < 0 or min(args.max_pages, args.max_review_checks, args.max_review_ranges) < 1:
-        parser.error("--min-likes 必须 >= 0，所有扫描上限必须 >= 1")
+    if args.min_likes < 0 or args.max_review_checks < 0 or min(args.max_pages, args.max_review_ranges) < 1:
+        parser.error("--min-likes 和 --max-review-checks 必须 >= 0，页数和范围上限必须 >= 1")
     if args.personal_only and args.review_id:
         parser.error("--personal-only 不抓取读者观点，请移除此选项后使用 --review-id。")
     if args.liked_source == "links" and not args.review_id:
