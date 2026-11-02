@@ -367,6 +367,59 @@ class LikedThoughtTests(unittest.TestCase):
         self.assertEqual(client.cookie, "")
 
 
+class ConcurrentVerificationTests(unittest.TestCase):
+    def test_concurrent_requests_keep_order_and_check_every_candidate(self):
+        from threading import Barrier, Lock
+        client = w.Weread(api_key='wrk-test', review_workers=3, liked_source='links',
+                          review_ids=['456_a', '456_b', '456_c'])
+        barrier, lock, fetched = Barrier(3), Lock(), []
+        def request(path, params=None, **kwargs):
+            rid = params['reviewId']
+            with lock:
+                fetched.append(rid)
+            barrier.wait(timeout=5)  # 串行实现无法通过此断言。
+            return {'reviewId': rid, 'review': {'bookId': 'b', 'content': rid,
+                                               'isLike': int(rid != '456_b')}}
+        client.request = request
+        with contextlib.redirect_stdout(io.StringIO()):
+            rows, _ = client.liked_thoughts('b', [], [], set())
+        self.assertEqual([r['reviewId'] for r in rows], ['456_a', '456_c'])
+        self.assertCountEqual(fetched, client.review_ids)
+        self.assertEqual(client.last_liked_scan['verified_candidates'], 3)
+
+    def test_concurrent_error_is_delivered_to_normal_validation(self):
+        client = w.Weread(api_key='wrk-test', review_workers=2)
+        client.request = Mock(side_effect=w.ExportError('network failure'))
+        details = client._review_details([('456_a', {}), ('456_b', {})], {}, set())
+        try:
+            for _, fetch in details:
+                with self.assertRaises(w.ExportError):
+                    fetch()
+        finally:
+            details.close()
+
+    def test_cached_seed_and_own_content_do_not_trigger_extra_requests(self):
+        client = w.Weread(api_key='wrk-test', review_workers=2)
+        client.request = Mock(side_effect=AssertionError('unneeded request'))
+        details = list((item, fetch()) for item, fetch in client._review_details(
+            [('456_a', {}), ('123_own', {})], {'456_a': {'value': 1}}, {'123_own'}))
+        self.assertEqual([value for _, value in details], [{'value': 1}, None])
+        client.request.assert_not_called()
+
+    def test_limit_response_slows_all_following_requests(self):
+        from email.message import Message
+        client = w.Weread(api_key='wrk-test', review_workers=6)
+        headers = Message()
+        headers['Retry-After'] = '3'
+        error = w.HTTPError('https://weread.qq.com', 429, 'busy', headers, None)
+        client.agent_opener = Mock()
+        client.agent_opener.open.side_effect = [error, error, error, error]
+        with patch.object(w.time, 'sleep'), self.assertRaises(w.ExportError):
+            client.request('/review/single', {'reviewId': '456_a'}, agent=True)
+        self.assertGreaterEqual(client._agent_interval, 0.4)
+        self.assertGreater(client._cooldown_until, 0)
+
+
 class BatchedDiscoveryTests(unittest.TestCase):
     def run_scan(self, *, partial=False, reject=False, pages=100, pagination=False):
         client = w.Weread(api_key='wrk-test', max_pages=pages)

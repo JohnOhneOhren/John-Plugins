@@ -20,6 +20,8 @@ import sys
 import time
 import uuid
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock, local, current_thread, main_thread
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
@@ -286,7 +288,7 @@ class Weread:
                  interactive_auth: bool = False, personal_only: bool = False, show_dates: bool = False,
                  liked_source: str = "paragraphs", review_ids: list[str] | None = None,
                  max_review_checks: int = 0, max_review_ranges: int = 500,
-                 review_batch_size: int = 5):
+                 review_batch_size: int = 5, review_workers: int = 1):
         self.cookie, self.vid = parse_cookie(cookie) if cookie else ("", "")
         self.api_key, self.max_pages = api_key, max_pages
         self.interactive_auth = interactive_auth
@@ -297,6 +299,13 @@ class Weread:
         if not 1 <= review_batch_size <= 20:
             raise ExportError("段落批量大小必须在 1 到 20 之间。")
         self.review_batch_size = review_batch_size
+        if not 1 <= review_workers <= 8:
+            raise ExportError("点赞核验并发数必须在 1 到 8 之间。")
+        self.review_workers = review_workers
+        self._request_lock = Lock()
+        self._thread_transport = local()
+        self._agent_interval = 0.2 if review_workers > 1 else 0.4
+        self._cooldown_until = 0.0
         self.last_liked_scan = {}
         self.cookie_policy = DefaultCookiePolicy()
         self.cookiejar = CookieJar(policy=self.cookie_policy)
@@ -386,12 +395,20 @@ class Weread:
         body = json.dumps(payload).encode() if post else None
         session_retried = False
         for attempt in range(5):
-            time.sleep(max(0, 0.4 - (time.monotonic() - self.last_request)))
-            self.last_request = time.monotonic()
+            # 全体工作线程共享发起频率和服务端退避，不能各自突破限速。
+            with self._request_lock:
+                interval = self._agent_interval if agent else 0.4
+                time.sleep(max(0, self.last_request + interval - time.monotonic(),
+                               self._cooldown_until - time.monotonic()))
+                self.last_request = time.monotonic()
             # 每次构造新 Request，让 CookieJar 注入最新凭证，绝不重发固定 Cookie 头。
             request = Request(url, data=body, headers=headers)
             try:
                 opener = self.agent_opener if agent else self.opener
+                if agent and current_thread() is not main_thread():
+                    if not hasattr(self._thread_transport, 'opener'):
+                        self._thread_transport.opener = build_opener(NoRedirect())
+                    opener = self._thread_transport.opener
                 with opener.open(request, timeout=30) as response:
                     if not agent:
                         self._accept_rotated_cookies(response, request)
@@ -408,6 +425,10 @@ class Weread:
                     raise self._session_failure(path, "HTTP 401") from None
                 if exc.code in (429, 500, 502, 503, 504) and attempt < 3:
                     delay = max(2 ** attempt, number(exc.headers.get("Retry-After"), 0))
+                    if agent and exc.code == 429:
+                        with self._request_lock:
+                            self._agent_interval = min(2.0, self._agent_interval * 2)
+                            self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
                     print(f"  服务繁忙，{delay} 秒后重试…")
                     time.sleep(delay)
                     continue
@@ -609,6 +630,36 @@ class Weread:
         notebook.liked_scan = {**self.last_liked_scan, 'exported_liked': len(liked)} if self.last_liked_scan else {}
         return notebook
 
+    def _review_details(self, selected, seed_details, own_ids):
+        """有界预取，主线程按原顺序验证和聚合；异常在对应条目处理处抛出。"""
+        def fetch(item):
+            rid = item[0]
+            if rid in own_ids:
+                return None
+            return seed_details[rid] if rid in seed_details else self.request(
+                '/review/single', {'reviewId': rid}, agent=True)
+        if self.review_workers == 1:
+            for item in selected:
+                yield item, lambda item=item: fetch(item)
+            return
+        with ThreadPoolExecutor(max_workers=self.review_workers, thread_name_prefix='weread-review') as pool:
+            pending = deque()
+            iterator = iter(selected)
+            for _ in range(self.review_workers):
+                item = next(iterator, None)
+                if item is not None:
+                    pending.append((item, pool.submit(fetch, item)))
+            try:
+                while pending:
+                    item, future = pending.popleft()
+                    yield item, future.result
+                    following = next(iterator, None)
+                    if following is not None:
+                        pending.append((following, pool.submit(fetch, following)))
+            finally:
+                for _, future in pending:
+                    future.cancel()
+
     def liked_thoughts(self, bid: str, chapters: list[dict], highlights: list[dict],
                       own_ids: set[str]) -> tuple[list[dict], list[str]]:
         """发现候选后逐条用官方 single 核验，范围有限，始终写明覆盖边界。
@@ -791,15 +842,17 @@ class Weread:
             warnings.append(f"发现 {len(ordered)} 条候选想法，本次仅核验前 {self.max_review_checks} 条，仍可能遗漏；可提高 --max-review-checks。")
         print(f"  共发现 {len(candidates)} 条候选想法；指定链接优先，其次核验列表提示已点赞的内容。")
         selected = ordered[:self.max_review_checks] if self.max_review_checks else ordered
-        for index, (rid, context) in enumerate(selected):
+        verify_started = time.monotonic()
+        print(f'  点赞核验并发数：{self.review_workers}；遇到限流会统一减速重试。')
+        for index, ((rid, context), fetch_detail) in enumerate(self._review_details(selected, seed_details, own_ids)):
             if rid in own_ids:
                 if rid in explicit_ids:
                     print(f"  指定想法 {rid} 未收录：个人笔记接口将其列为本人内容。")
                 continue
-            if index % 10 == 0:
-                print(f"  正在逐条核验点赞状态 {index + 1}/{len(selected)}…")
+            if index % 50 == 0:
+                print(f"  正在核验点赞状态 {index + 1}/{len(selected)}，已用 {int(time.monotonic() - verify_started)} 秒…")
             try:
-                data = seed_details[rid] if rid in seed_details else self.request("/review/single", {"reviewId": rid}, agent=True)
+                data = fetch_detail()
                 row = unwrap_review_detail(data)
                 if str(row.get("reviewId") or "") != rid:
                     raise ExportError("想法详情 ID 不一致。")
@@ -841,6 +894,8 @@ class Weread:
         print(f"  已核验 {verified} 条想法：已点赞 {len(result)} 条，未点赞 {unliked} 条，状态未知 {unknown} 条。")
         self.last_liked_scan = {'scope': self.liked_source, 'known_ranges': len(ranges),
                                'range_requests': range_requests, 'range_batch_size': self.review_batch_size,
+                               'review_workers': self.review_workers,
+                               'verification_seconds': round(time.monotonic() - verify_started, 2),
                                'scheduled_ranges': scheduled_count, 'visited_ranges': len(visited_ranges),
                                'completed_ranges': len(completed_ranges), 'pages_read': page_count,
                                'discovered_candidates': len(candidates), 'selected_candidates': len(selected),

@@ -133,6 +133,7 @@ def main(argv=None):
     prep.add_argument('--max-review-ranges', type=int, default=500)
     prep.add_argument('--max-review-pages', type=int, default=1000)
     prep.add_argument('--review-batch-size', type=int, default=5, help='同章范围合并查询数；1 关闭批量查询')
+    prep.add_argument('--review-workers', type=int, default=6, help='有界并发核验数，1 到 8，默认 6')
     prep.add_argument('--review-id', action='append', default=[], help='优先核验用户提供的想法 ID 或详情链接')
     prep.add_argument('--liked-source', choices=['paragraphs', 'links'], default='paragraphs')
     args = parser.parse_args(argv)
@@ -222,7 +223,8 @@ def main(argv=None):
                                          review_ids=getattr(args, 'review_id', []),
                                          liked_source=getattr(args, 'liked_source', 'paragraphs'),
                                          max_review_ranges=getattr(args, 'max_review_ranges', 500),
-                                         review_batch_size=getattr(args, 'review_batch_size', 5))
+                                         review_batch_size=getattr(args, 'review_batch_size', 5),
+                                         review_workers=getattr(args, 'review_workers', 6))
                     shelf = client.shelf()
                     if args.command == 'shelf':
                         result = {'books': book_choices(shelf)}
