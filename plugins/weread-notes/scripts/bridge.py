@@ -137,7 +137,12 @@ def main(argv=None):
                           'dependencies': {m: importlib.util.find_spec(m) is not None for m in ['docx', 'notion_client']},
                           'weread_authorized_in_environment': bool(os.environ.get('WEREAD_API_KEY')),
                           'auth': credentials.status(), 'interaction': 'codex_chat_only',
-                          'edge_required': False, 'notion_connector': '由 Codex 检查当前用户连接'}
+                          'edge_required': False, 'notion_connector': '由 Codex 检查当前用户连接',
+                          'external_dependencies': {'notion': {'required_for': ['notion'],
+                                                              'status': 'host_check_required',
+                                                              'discovery_query': 'Notion'},
+                                                    'word': {'external_plugin_required': False}},
+                          'next_check': ['preflight', '--format', 'word|notion']}
             elif args.command == 'sync-plan':
                 delta = incremental.notion_delta(json.loads(args.plan.read_text(encoding='utf-8')),
                                                 json.loads(args.existing.read_text(encoding='utf-8')),

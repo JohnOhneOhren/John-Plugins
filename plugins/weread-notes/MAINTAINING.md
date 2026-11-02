@@ -1,5 +1,7 @@
 # 发布与兼容维护
 
+0.6.0 新增按导出方式执行的 preflight/setup。Notion 安装/连接状态由宿主工具检查后形成最小快照，未知、未连接、缺评论能力分别返回待处理状态，不能通过本地 notion-client 推断。setup 仅在用户状态目录补齐固定 Python 库，launch 后续自动复用隔离解释器。外部插件通过动态搜索和宿主建议入口安装，用户本人授权后复查；社区插件的依赖元数据可能无法被公共目录解析，因此仍保留实际搜索流程。没有向 plugin.json 添加未经支持的依赖字段。构建清单须包含 dependencies.py 与 dependencies.md。
+
 核心实现来源是仓库根目录 weread_notes.py，构建时同步到插件，不要分别修改两个副本。bridge.py 输出的 notion-plan schema_version=2，正文、稳定身份和评论分离。已有的单条点赞判断、严格章节关联、日期选择与精简版式均保留。
 
 0.5.0 需要先取得明确的 Key 保存偏好：auth import 必须 --remember 或 --temporary，缺省返回 retention_required；Node 管道适配器不能静默设 remember:false。auth retention 可复用现有加密授权调整保存方式。Word prepare 必须 --word-mode existing + --word-target，或 --word-mode new + 明确 --output 文件夹，检查在抓取之前完成。Word 增量更新完全不重设旧段落间距/字体，仅新增段落沿用排版模板；对无标题的手工旧文件只做唯一精确匹配。回归测试比较旧段落、用户手写段落及表格的 XML，确认添加前后未被重写。

@@ -5,7 +5,7 @@ description: 从用户微信读书书架选书，导出按章节整理的划线�
 
 通过本插件的 Python 工具访问微信读书。需要本地执行能力、Python 3.10+；没有这些能力时说明限制，不能声称仅凭网页已登录即可抓取。
 
-入口是相对此文件 `../../scripts/launch.py`。使用本地后台命令工具执行，不打开 PowerShell、终端面板或外部窗口，不使用 tty，不调用旧版 weread_notes.py 交互向导。先 `python <入口绝对路径> doctor`，缺少依赖时在用户可写的插件状态目录或工作目录创建独立虚拟环境，后台安装插件根目录 requirements.txt；不修改系统 Python 或只读插件缓存。已有可用解释器则直接使用。先读取 `../../GUIDE.md` 的授权与更新说明；维护接口时再读 `../../MAINTAINING.md`。
+入口是相对此文件 `../../scripts/launch.py`。使用本地后台命令工具执行，不打开 PowerShell、终端面板或外部窗口，不使用 tty，不调用旧版 weread_notes.py 交互向导。先 `python <入口绝对路径> doctor`，并读取 [references/dependencies.md](references/dependencies.md) 完成首次使用依赖检查；所选 Word/Notion 的必要能力就绪后再开始抓取。缺少本地运行库时后台执行 `setup --format word|notion`，在用户状态目录补齐独立环境；后续同一入口自动沿用该环境，不修改系统 Python 或只读插件缓存。先读取 `../../GUIDE.md` 的授权与更新说明；维护接口时再读 `../../MAINTAINING.md`。
 
 ## 交互与授权
 
@@ -31,7 +31,7 @@ Word 调用必须带用户所选目标模式：现有文件用 `--word-mode exis
 
 默认再次同步采用目标实际内容对比，先读 [references/incremental.md](references/incremental.md)。定位同书、同目标的旧笔记，重新读取完整当前正文和全部原生评论（包括已解决），运行 sync-plan 补齐新增和被删除的缺项；不能仅凭旧回执断言“无新增”。既有内容不覆盖、不重复插入。已有原文上的新增评论也要导入，不能因为原文已存在就跳过整组。每条摘抄间留一个真实空段落，已存在则不叠加。用户明确要求保留 Notion 的手动删除状态才用 --respect-deletions；明确另建一份才用 --sync-mode new。
 
-优先用用户已经连接的 Notion 工具；缺少连接时引导连接，或提供脚本 Integration Token 方式，不能声称插件捆绑了用户的 Notion 账号。阅读 Notion 工具要求的 Markdown 规范。
+优先用用户已经连接的 Notion 工具；缺少工具或连接时，按依赖参考主动查找 Notion 插件、展示宿主安装/连接入口并复查，不能只说“没有 Notion”。安装和账号授权需用户在宿主完成，不代填凭证、不声称已自动安装或已连接。公共 notion-client 不是宿主连接器的替代证明，Integration Token 仅在用户明确选择独立脚本方式时使用。阅读 Notion 工具要求的 Markdown 规范。
 
 读取 prepare 生成的 notion-plan JSON：content 是首次导入时使用的完整正文；增量导入必须使用 sync-plan 的结果，不能再次追加 content。records 是稳定去重身份，comments 单独存放。正文保持普通段落、章节 heading_2、横线和明确空段落 `<p />`。不可改为 quote 竖线、斜体正文、用户名或赞数。
 
