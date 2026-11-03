@@ -115,5 +115,83 @@ class LikedCoverageTests(unittest.TestCase):
         self.assertFalse(client.last_liked_scan['complete_within_known_ranges'])
 
 
+class HighlightOverlapTests(unittest.TestCase):
+    def fixture(self, *, pages=100, limit=0, unknown=False, pagination=False, wrong_detail=False):
+        client = w.Weread(api_key='wrk-fixture', liked_source='highlights', max_pages=pages,
+                          max_review_ranges=limit)
+        calls, detail_ids = [], []
+        def request(path, params=None, **kwargs):
+            calls.append((path, params))
+            if path == '/book/bestbookmarks':
+                return {'items': []}
+            if path == '/book/underlines':
+                return {'underlines': [{'range': s} for s in
+                    ['50-120', '120-130', '80-250', '200-210', '250-300', 'bad', '300-250', '120-130']]}
+            if path == '/book/readreviews':
+                return {'reviews': [{'range': p['range'], 'hasMore': int(pagination and not p['maxIdx']),
+                    'maxIdx': 1, 'synckey': 1, 'pageReviews': [
+                        {'reviewId': '456_' + p['range'] + ('x' if p['maxIdx'] else ''),
+                         'review': {'range': p['range'], 'chapterUid': params['chapterUid']}},
+                        {'reviewId': '456_outside', 'review': {'range': '900-950', 'chapterUid': 1}}]}
+                    for p in reversed(params['reviews'])]}
+            rid = params['reviewId']
+            detail_ids.append(rid)
+            row = {'bookId': 'b', 'chapterUid': 2 if wrong_detail else 1,
+                   'range': rid.split('_')[1].rstrip('x'), 'content': 'fixture',
+                   'author': {'userVid': 456}}
+            if not unknown:
+                row['isLike'] = int('120-130' in rid)
+            return {'reviewId': rid, 'review': row}
+        client.request = request
+        return client, calls, detail_ids
+
+    def scan(self, client, marks=None):
+        if marks is None:
+            marks = [{'chapterUid': 1, 'range': '100-200', 'markText': 'fixture'}]
+        with contextlib.redirect_stdout(io.StringIO()):
+            return client.liked_thoughts('b', [{'chapterUid': 1}, {'chapterUid': 2}], marks, set())
+
+    def test_overlap_containment_edges_and_chapter_isolation(self):
+        client, calls, details = self.fixture()
+        rows, _ = self.scan(client)
+        requested = {p['range'] for path, params in calls if path == '/book/readreviews' for p in params['reviews']}
+        self.assertEqual(requested, {'100-200', '50-120', '120-130', '80-250', '200-210'})
+        self.assertEqual([r['reviewId'] for r in rows], ['456_120-130'])
+        self.assertNotIn('456_outside', details)
+        self.assertTrue(all(p['chapterUid'] == 1 for path, p in calls if path != '/review/single'))
+        self.assertTrue(client.last_liked_scan['complete_within_known_ranges'])
+
+    def test_all_overlap_ranges_are_paged(self):
+        client, _, details = self.fixture(pagination=True)
+        rows, _ = self.scan(client)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(client.last_liked_scan['pages_read'], 10)
+        self.assertEqual(len(details), 10)
+
+    def test_no_highlights_does_not_scan_other_readers(self):
+        client, calls, _ = self.fixture()
+        self.assertEqual(self.scan(client, [])[0], [])
+        self.assertEqual(calls, [])
+
+    def test_limits_and_unknown_status_are_incomplete_not_empty_success(self):
+        for options in ({'pages': 1}, {'limit': 1}, {'unknown': True}):
+            client, _, _ = self.fixture(**options)
+            with self.assertRaises(w.ExportError):
+                self.scan(client)
+            self.assertFalse(client.last_liked_scan['complete_within_known_ranges'])
+
+    def test_actual_detail_location_is_rechecked(self):
+        client, _, _ = self.fixture(wrong_detail=True)
+        rows, _ = self.scan(client)
+        self.assertEqual(rows, [])
+        self.assertEqual(client.last_liked_scan['outside_highlights'], 5)
+
+    def test_missing_highlight_positions_block_completeness(self):
+        client, _, _ = self.fixture()
+        with self.assertRaises(w.ExportError):
+            self.scan(client, [{'chapterUid': 1, 'range': 'not-a-range'}])
+        self.assertEqual(client.last_liked_scan['invalid_highlight_locations'], 1)
+
+
 if __name__ == '__main__':
     unittest.main()
