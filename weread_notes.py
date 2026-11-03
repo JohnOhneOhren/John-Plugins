@@ -50,6 +50,10 @@ class RequestError(ExportError):
         return self.kind == 'network' or self.code in (401, 403, 429, 499, 500, 502, 503, 504)
 
 
+class DeletedReview(ExportError):
+    """仅当官方分享页明确显示删除标题时使用，不能仅根据业务码推断。"""
+
+
 def http_error_diagnostic(exc):
     """只留大小、结构、数值错误码和固定提示类别，不存原始响应/自由文本。"""
     headers = exc.headers or {}
@@ -363,6 +367,7 @@ class Weread:
         self._halt_error = None
         self.last_liked_scan = {}
         self.failed_review_ids = []  # 仅供本机定点复查；不进入计数报告或公开包。
+        self._deleted_review_cache = {}
         self.cookie_policy = DefaultCookiePolicy()
         self.cookiejar = CookieJar(policy=self.cookie_policy)
         self._seeded_cookies = {}
@@ -429,6 +434,36 @@ class Weread:
                            "可能是凭证失效、缺少会话字段或服务端拒绝此客户端；"
                            "仅凭此代码无法确定原因，请保留错误以继续排查。")
 
+    def _confirm_review_deleted(self, rid):
+        if not isinstance(rid, str) or not re.fullmatch(r'\d+_[A-Za-z0-9_-]+', rid):
+            return False
+        if rid in self._deleted_review_cache:
+            return self._deleted_review_cache[rid]
+        # 独立匿名请求，绝不把 API Key / Cookie 发到分享页或跟随重定向。
+        request = Request(self.WEB + '/review-detail?' + urlencode({'reviewid': rid, 'type': 1}),
+                          headers={'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html'})
+        confirmed = False
+        try:
+            with self._request_lock:
+                time.sleep(max(0, self.last_request + 0.4 - time.monotonic(),
+                               self._cooldown_until - time.monotonic()))
+                self.last_request = time.monotonic()
+            try:
+                with build_opener(NoRedirect()).open(request, timeout=15) as response:
+                    raw = response.read(262144)
+            except HTTPError as exc:
+                # 微信分享页本身也可能返回 499；仍须检查明确的页面标题。
+                if exc.code not in (404, 410, 499):
+                    raise
+                raw = exc.read(262144)
+                exc.close()
+            title = re.search(r'<title[^>]*>(.*?)</title>', raw.decode('utf-8', 'replace'), re.I | re.S)
+            confirmed = bool(title and html.unescape(title.group(1)).strip() == '该想法已被删除')
+        except (OSError, ValueError, URLError):
+            pass
+        self._deleted_review_cache[rid] = confirmed
+        return confirmed
+
     def request(self, path: str, params: dict | None = None, *, post: bool = False,
                 agent: bool = False, legacy: bool = False, _recover_session: bool = True) -> dict:
         # 旧接口只开放已核对的划线查询，不能传入任意主机或任意路径。
@@ -475,6 +510,10 @@ class Weread:
             except HTTPError as exc:
                 diagnostic = http_error_diagnostic(exc)
                 diagnostic['attempts'] = attempt + 1
+                if (agent and path == '/review/single' and exc.code == 499 and
+                        diagnostic.get('business_code') == -2031 and
+                        self._confirm_review_deleted(params.get('reviewId'))):
+                    raise DeletedReview('官方分享页确认该想法已删除，正文无法读取。') from None
                 if not agent:
                     self._accept_rotated_cookies(exc, request)
                 if exc.code == 401 and not agent and _recover_session:
@@ -706,8 +745,11 @@ class Weread:
             if rid in own_ids:
                 return None
             try:
-                return seed_details[rid] if rid in seed_details else self.request(
-                    '/review/single', {'reviewId': rid}, agent=True)
+                if rid in seed_details:
+                    if isinstance(seed_details[rid], DeletedReview):
+                        raise seed_details[rid]
+                    return seed_details[rid]
+                return self.request('/review/single', {'reviewId': rid}, agent=True)
             except RequestError as exc:
                 if exc.stops_scan:
                     with self._request_lock:
@@ -796,7 +838,11 @@ class Weread:
             for rid in candidates:
                 if rid in own_ids:
                     continue
-                data = self.request("/review/single", {"reviewId": rid}, agent=True)
+                try:
+                    data = self.request("/review/single", {"reviewId": rid}, agent=True)
+                except DeletedReview as exc:
+                    seed_details[rid] = exc
+                    continue
                 row = unwrap_review_detail(data)
                 if str(row.get("reviewId") or "") != rid:
                     raise ExportError("指定想法详情的 ID 与请求不一致。")
@@ -956,6 +1002,7 @@ class Weread:
                 raise ExportError("链接模式需要至少一个 --review-id 想法链接或 ID。")
             warnings.append("读者观点仅核验本次提供的想法链接，未扫描全书其他点赞记录。")
         result, unknown, unliked, verified, attempted = [], 0, 0, 0, 0
+        deleted = 0
         outside_highlights = 0
         ordered = sorted(candidates.items(), key=lambda item: priorities.get(item[0], 2))
         if self.max_review_checks and len(ordered) > self.max_review_checks:
@@ -1006,6 +1053,10 @@ class Weread:
                         print(f"  指定想法 {rid} 已确认点赞，正在核对作者与导出条件。")
                 elif rid in explicit_ids:
                     print(f"  指定想法 {rid} 未收录：详情正文为空。")
+            except DeletedReview:
+                deleted += 1
+                if rid in explicit_ids:
+                    print(f'  指定想法 {rid} 的官方分享页确认已删除，无法读取原文。')
             except ExportError as exc:
                 # 用户指定的样本失败时必须明确停止，不能静默跳过验证目标。
                 record_failure(exc)
@@ -1022,7 +1073,10 @@ class Weread:
             warnings.append(f"{failed} 个章节、段落或想法未能读取，本次读者观点不完整。")
         if unknown:
             warnings.append(f"{unknown} 条想法没有可确认的点赞状态，未收录。")
-        print(f"  已核验 {verified} 条想法：已点赞 {len(result)} 条，未点赞 {unliked} 条，状态未知 {unknown} 条。")
+        if deleted:
+            warnings.append(f'{deleted} 条候选想法已由官方分享页确认删除，正文无法恢复；不作为未点赞处理。')
+        print(f"  已核验 {verified} 条想法：已点赞 {len(result)} 条，未点赞 {unliked} 条，状态未知 {unknown} 条；"
+              f"另有 {deleted} 条经官方确认删除，正文无法恢复。")
         self.last_liked_scan = {'scope': self.liked_source, 'known_ranges': len(ranges),
                                'range_requests': range_requests, 'range_batch_size': self.review_batch_size,
                                'review_workers': self.review_workers,
@@ -1033,6 +1087,8 @@ class Weread:
                                'verified_candidates': verified, 'attempted_candidates': attempted,
                                'unchecked_candidates': len(ordered) - attempted - sum(rid in own_ids for rid, _ in selected),
                                'confirmed_liked': len(result), 'unliked': unliked, 'unknown': unknown,
+                               'confirmed_deleted': deleted, 'resolved_candidates': verified + deleted + outside_highlights,
+                               'has_unrecoverable_deleted_content': bool(deleted),
                                'failed_requests': failed, 'pending_pages': pending_pages,
                                'failure_reasons': dict(failure_reasons), 'stopped_reason': stopped_reason,
                                'failure_diagnostics': failure_diagnostics,
@@ -1293,6 +1349,10 @@ def concise_notices(warnings: list[str]) -> list[str]:
     """阅读文档只留一条范围说明，完整错误和统计继续显示在终端。"""
     if not warnings:
         return []
+    for warning in warnings:
+        if '条候选想法已由官方分享页确认删除' in warning:
+            count = re.match(r'\d+', warning)
+            return [f"{count[0] if count else '部分'}条候选想法已删除，正文无法恢复；仅整理当前可读取内容。"]
     if any("本次按用户选择未抓取" in w for w in warnings):
         return ["本次仅含个人划线与想法。"]
     if any("已点赞他人评论接口读取失败" in w for w in warnings):

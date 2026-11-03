@@ -367,6 +367,62 @@ class LikedThoughtTests(unittest.TestCase):
         self.assertEqual(client.cookie, "")
 
 
+class DeletedReviewTests(unittest.TestCase):
+    def test_business_code_requires_independent_deletion_confirmation(self):
+        for confirmed in (False, True):
+            transport = ScriptedHTTPS([(499, {'errcode': -2031}, None) for _ in range(4)])
+            client = w.Weread(api_key='wrk-fixture')
+            client.agent_opener = w.build_opener(w.NoRedirect(), transport)
+            with patch.object(w.time, 'sleep'), patch.object(client, '_confirm_review_deleted', return_value=confirmed), \
+                    contextlib.redirect_stdout(io.StringIO()), self.assertRaises(w.DeletedReview if confirmed else w.RequestError):
+                client.request('/review/single', {'reviewId': '456_dead'}, agent=True)
+            self.assertEqual(len(transport.requests), 1 if confirmed else 4)
+
+    def test_share_page_title_can_confirm_deleted_without_credentials(self):
+        from email.message import Message
+        for title, expected in [('该想法已被删除', True), ('微信读书', False)]:
+            client = w.Weread(api_key='wrk-private-fixture')
+            opener = Mock()
+            body = ('<title>' + title + '</title><p>该想法已被删除</p>').encode('utf-8')
+            opener.open.side_effect = w.HTTPError('https://weread.qq.com', 499, 'error', Message(), io.BytesIO(body))
+            with patch.object(w, 'build_opener', return_value=opener), patch.object(w.time, 'sleep'):
+                self.assertEqual(client._confirm_review_deleted('456_dead'), expected)
+            request = opener.open.call_args.args[0]
+            self.assertIsNone(request.get_header('Authorization'))
+            self.assertIsNone(request.get_header('Cookie'))
+
+    def test_confirmed_deleted_does_not_hide_or_block_live_liked_content(self):
+        client = w.Weread(api_key='wrk-fixture', liked_source='highlights')
+        def request(path, params=None, **kwargs):
+            if path == '/book/bestbookmarks': return {'items': []}
+            if path == '/book/underlines': return {'underlines': []}
+            if path == '/book/readreviews':
+                return {'reviews': [{'range': '1-10', 'hasMore': 0, 'pageReviews': [
+                    {'reviewId': '456_dead'}, {'reviewId': '456_live'}]}]}
+            if params['reviewId'] == '456_dead': raise w.DeletedReview('confirmed')
+            return {'reviewId': '456_live', 'review': {'bookId': 'b', 'chapterUid': 1,
+                    'range': '1-10', 'isLike': 1, 'content': 'fixture', 'author': {'userVid': 456}}}
+        client.request = request
+        with contextlib.redirect_stdout(io.StringIO()):
+            rows, warnings = client.liked_thoughts('b', [{'chapterUid': 1}], [{'chapterUid': 1, 'range': '1-10'}], set())
+        self.assertEqual([r['reviewId'] for r in rows], ['456_live'])
+        self.assertEqual(client.last_liked_scan['confirmed_deleted'], 1)
+        self.assertEqual(client.last_liked_scan['resolved_candidates'], 2)
+        self.assertEqual(client.last_liked_scan['unliked'], 0)
+        self.assertEqual(client.last_liked_scan['failed_requests'], 0)
+        self.assertTrue(client.last_liked_scan['has_unrecoverable_deleted_content'])
+        self.assertIn('无法恢复', w.concise_notices(warnings)[0])
+
+    def test_explicit_deleted_seed_is_counted_once(self):
+        client = w.Weread(api_key='wrk-fixture', liked_source='highlights', review_ids=['456_dead'])
+        client.request = Mock(side_effect=w.DeletedReview('confirmed'))
+        with contextlib.redirect_stdout(io.StringIO()):
+            rows, _ = client.liked_thoughts('b', [], [], set())
+        self.assertEqual(rows, [])
+        self.assertEqual(client.last_liked_scan['confirmed_deleted'], 1)
+        client.request.assert_called_once()
+
+
 class ConcurrentVerificationTests(unittest.TestCase):
     def test_persistent_499_stops_after_bounded_inflight_details(self):
         client = w.Weread(api_key='wrk-fixture', review_workers=3)
