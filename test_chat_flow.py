@@ -200,6 +200,8 @@ class ChatFlowTests(unittest.TestCase):
                                   '--review-id', '456_fixture', '--output', folder])
         self.assertEqual(code, 0)
         self.assertEqual(client.call_args.kwargs['max_review_checks'], 0)
+        self.assertEqual(client.call_args.kwargs['max_review_ranges'], 0)
+        self.assertEqual(client.call_args.kwargs['liked_source'], 'highlights')
         self.assertEqual(client.call_args.kwargs['review_ids'], ['456_fixture'])
 
     def test_liked_coverage_report_is_returned_and_saved_without_private_content(self):

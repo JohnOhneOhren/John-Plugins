@@ -223,6 +223,20 @@ def merge_review_context(context: dict, row: dict) -> dict:
     return result
 
 
+def parse_range(value):
+    """按数字比较位置；保守地把端点相接也视为相交，避免边界遗漏。"""
+    match = re.fullmatch(r'(\d+)-(\d+)', str(value or ''))
+    if not match:
+        return None
+    start, end = map(int, match.groups())
+    return (start, end) if start <= end else None
+
+
+def ranges_overlap(left, right):
+    a, b = parse_range(left), parse_range(right)
+    return bool(a is not None and b is not None and max(a[0], b[0]) <= min(a[1], b[1]))
+
+
 def author_id(row: dict) -> str:
     author = row.get("author") if isinstance(row.get("author"), dict) else {}
     return str(author.get("userVid") or author.get("vid") or row.get("userVid") or "")
@@ -578,7 +592,8 @@ class Weread:
             print("[3/5] 正在读取评论并严格筛选我点赞的他人想法…")
             try:
                 if self.api_key:
-                    public, scope_warnings = self.liked_thoughts(bid, chapters, highlights + mine, own_ids)
+                    scope_marks = highlights if self.liked_source == 'highlights' else highlights + mine
+                    public, scope_warnings = self.liked_thoughts(bid, chapters, scope_marks, own_ids)
                     warnings.extend(scope_warnings)
                 else:
                     public = self.pages("/web/review/list", {"bookId": bid, "listType": 11, "mine": 0,
@@ -703,13 +718,27 @@ class Weread:
         visited_ranges, completed_ranges = set(), set()
         scheduled_count = 0
         pending_pages = False
-        def add_range(row):
+        highlight_scope = self.liked_source == 'highlights'
+        marked_ranges = defaultdict(list)
+        invalid_marks = 0
+        for mark in highlights:
+            uid = str(mark.get('chapterUid', ''))
+            if uid and parse_range(mark.get('range')) is not None:
+                marked_ranges[uid].append(str(mark['range']))
+            else:
+                invalid_marks += 1
+        def in_highlights(uid, span):
+            return any(ranges_overlap(span, own) for own in marked_ranges.get(str(uid), []))
+        def add_range(row, *, overlap_only=False):
             uid, span = str(row.get("chapterUid", "")), str(row.get("range") or "")
-            if uid and re.fullmatch(r"\d+-\d+", span):
+            if overlap_only and not in_highlights(uid, span):
+                return
+            if uid and parse_range(span) is not None:
                 ranges.setdefault((uid, span), {"abstract": clean(row.get("markText") or row.get("abstract")), "chapterUid": uid, "range": span})
         seed_details = {}
-        if self.liked_source == "paragraphs":
-            warnings.append("读者观点仅覆盖个人笔记、指定链接、热门划线及章节划线位置中可定位的段落，不代表全书完整点赞记录。")
+        if self.liked_source in ('paragraphs', 'highlights'):
+            warnings.append('读者观点仅覆盖与本人划线重叠的接口可见范围及指定链接，不代表全书完整点赞记录。' if highlight_scope else
+                            "读者观点仅覆盖个人笔记、指定链接、热门划线及章节划线位置中可定位的段落，不代表全书完整点赞记录。")
             # 用户给出的链接也是原文定位入口，可补充热门 TOP20 之外的段落。
             for rid in candidates:
                 if rid in own_ids:
@@ -728,9 +757,10 @@ class Weread:
             for mark in highlights:
                 add_range(mark)
             seen_chapters = set()
-            for chapter in chapters:
+            scope_chapters = chapters + [{'chapterUid': uid} for uid in marked_ranges] if highlight_scope else chapters
+            for chapter in scope_chapters:
                 uid = str(chapter.get("chapterUid", ""))
-                if not uid or uid in seen_chapters:
+                if not uid or uid in seen_chapters or highlight_scope and uid not in marked_ranges:
                     continue
                 seen_chapters.add(uid)
                 print(f"  正在查找第 {len(seen_chapters)} 个章节中的读者想法…")
@@ -740,7 +770,7 @@ class Weread:
                         raise ExportError("热门划线响应缺少 items。")
                     for item in data["items"]:
                         if isinstance(item, dict):
-                            add_range({**item, "chapterUid": item.get("chapterUid", uid)})
+                            add_range({**item, "chapterUid": item.get("chapterUid", uid)}, overlap_only=highlight_scope)
                 except ExportError as exc:
                     record_failure(exc)
                     if isinstance(exc, RequestError) and exc.code in (401, 403, 429):
@@ -750,9 +780,11 @@ class Weread:
                     data = self.request('/book/underlines', {'bookId': bid, 'chapterUid': number(uid), 'synckey': 0}, agent=True)
                     if not isinstance(data.get('underlines'), list):
                         raise ExportError('章节划线位置响应缺少 underlines。')
+                    if str(data.get('hasMore', 0)).lower() in ('1', 'true'):
+                        raise ExportError('章节位置返回未完成分段数据，无法确认全部位置。')
                     for item in data['underlines']:
                         if isinstance(item, dict):
-                            add_range({**item, 'chapterUid': uid})
+                            add_range({**item, 'chapterUid': uid}, overlap_only=highlight_scope)
                 except ExportError as exc:
                     record_failure(exc)
                     if isinstance(exc, RequestError) and exc.code in (401, 403, 429):
@@ -763,9 +795,9 @@ class Weread:
             for key, context in ranges.items():
                 chapter_ranges[key[0]].append((key, context))
             scheduled = []
-            while any(chapter_ranges.values()) and len(scheduled) < self.max_review_ranges:
+            while any(chapter_ranges.values()) and (not self.max_review_ranges or len(scheduled) < self.max_review_ranges):
                 for group in chapter_ranges.values():
-                    if group and len(scheduled) < self.max_review_ranges:
+                    if group and (not self.max_review_ranges or len(scheduled) < self.max_review_ranges):
                         scheduled.append(group.popleft())
             scheduled_count = len(scheduled)
             if scheduled_count < len(ranges):
@@ -840,6 +872,10 @@ class Weread:
                         row = unwrap_review(entry)
                         rid = str(row.get("reviewId") or "")
                         if rid and rid not in own_ids:
+                            # 列表实际位置优先于查询范围，防止接口返回相邻但不相交的想法。
+                            if highlight_scope and rid not in explicit_ids and not in_highlights(
+                                    row.get('chapterUid', uid), row.get('range') or span):
+                                continue
                             metadata = {k: row[k] for k in ("chapterUid", "chapterName", "range", "abstract", "author", "userVid", "likesCount", "likeCount") if k in row}
                             detail_context = merge_review_context(context, metadata)
                             candidates[rid] = merge_review_context(detail_context, candidates.get(rid, {}))
@@ -867,6 +903,7 @@ class Weread:
                 raise ExportError("链接模式需要至少一个 --review-id 想法链接或 ID。")
             warnings.append("读者观点仅核验本次提供的想法链接，未扫描全书其他点赞记录。")
         result, unknown, unliked, verified, attempted = [], 0, 0, 0, 0
+        outside_highlights = 0
         ordered = sorted(candidates.items(), key=lambda item: priorities.get(item[0], 2))
         if self.max_review_checks and len(ordered) > self.max_review_checks:
             warnings.append(f"发现 {len(ordered)} 条候选想法，本次仅核验前 {self.max_review_checks} 条，仍可能遗漏；可提高 --max-review-checks。")
@@ -895,6 +932,11 @@ class Weread:
                     continue
                 if not book_id and not context:
                     raise ExportError("想法缺少书籍信息，不能关联到当前书籍。")
+                located = merge_review_context(context, row)
+                if highlight_scope and rid not in explicit_ids and not in_highlights(
+                        located.get('chapterUid'), located.get('range')):
+                    outside_highlights += 1
+                    continue
                 state = like_state(row, official_detail=True)
                 verified += 1
                 if state is None:
@@ -938,12 +980,16 @@ class Weread:
                                'confirmed_liked': len(result), 'unliked': unliked, 'unknown': unknown,
                                'failed_requests': failed, 'pending_pages': pending_pages,
                                'failure_reasons': dict(failure_reasons), 'stopped_reason': stopped_reason,
-                               'complete_within_known_ranges': self.liked_source == 'paragraphs' and
+                               'highlight_count': len(highlights), 'invalid_highlight_locations': invalid_marks,
+                               'highlight_chapters': len(marked_ranges), 'outside_highlights': outside_highlights,
+                               'complete_within_known_ranges': self.liked_source in ('paragraphs', 'highlights') and
                                    len(completed_ranges) == len(ranges) and not failed and not unknown and
-                                   len(selected) == len(ordered) and not stopped_reason,
+                                   len(selected) == len(ordered) and not stopped_reason and not (highlight_scope and invalid_marks),
                                'full_book_complete': False}
         print(f'  范围统计：读完 {len(completed_ranges)}/{len(ranges)} 个已知范围，'
               f'核验 {verified}/{len(candidates)} 条候选；这不是全书点赞清单。')
+        if highlight_scope and not self.last_liked_scan['complete_within_known_ranges']:
+            raise ExportError('划线重叠范围核验未完成：存在读取失败、位置缺失、未知状态或扫描限额；已停止导出，请查看范围报告。')
         if stopped_reason or failed and not verified:
             raise ExportError(f"读者想法核验未完成：成功 {verified} 条，读取失败 {failed} 处，"
                               f"原因 {stopped_reason or '读取/校验失败'}。不能将此结果视为没有点赞记录。")
@@ -1780,12 +1826,12 @@ def main() -> int:
     parser.add_argument("--check-review", nargs="?", const="", default=None, metavar="REVIEW_ID_OR_URL",
                         help="只验证单条想法是否返回点赞状态，不抓书架、不导出正文")
     parser.add_argument("--personal-only", action="store_true", help="仅导出个人划线与想法，使用 Agent Key 时无需 Cookie，不抓取点赞评论")
-    parser.add_argument("--liked-source", choices=("paragraphs", "links"), default="paragraphs",
-                        help="读者观点来源：paragraphs 自动扫描可发现段落；links 仅核验指定链接")
+    parser.add_argument("--liked-source", choices=("highlights", "paragraphs", "links"), default="highlights",
+                        help="highlights 扫描与本人划线重叠的位置；paragraphs 广泛扫描；links 仅核验指定链接")
     parser.add_argument("--review-id", action="append", default=[], metavar="ID_OR_URL",
                         help="优先核验的想法 ID 或链接，可重复；仅收录仍由当前账号点赞且属于所选书籍的想法")
     parser.add_argument("--max-review-checks", type=int, default=0, help="官方单条核验上限，默认 0 核验全部已发现候选；正数为用户选择的限额")
-    parser.add_argument("--max-review-ranges", type=int, default=500, help="自动扫描原文范围上限，默认 500")
+    parser.add_argument("--max-review-ranges", type=int, default=0, help="原文范围上限，默认 0 扫描全部已发现范围")
     dates = parser.add_mutually_exclusive_group()
     dates.add_argument("--show-dates", dest="show_dates", action="store_true", help="在正文后标注简短日期，如（2026-10-28）")
     dates.add_argument("--hide-dates", dest="show_dates", action="store_false", help="不在导出内容中显示日期")
@@ -1795,8 +1841,8 @@ def main() -> int:
     parser.add_argument("--min-likes", type=int, default=0, help="已点赞评论的额外点赞数门槛，默认不设门槛")
     parser.add_argument("--max-pages", type=int, default=1000, help="翻页保护上限，达到时明确报错")
     args = parser.parse_args()
-    if args.min_likes < 0 or args.max_review_checks < 0 or min(args.max_pages, args.max_review_ranges) < 1:
-        parser.error("--min-likes 和 --max-review-checks 必须 >= 0，页数和范围上限必须 >= 1")
+    if min(args.min_likes, args.max_review_checks, args.max_review_ranges) < 0 or args.max_pages < 1:
+        parser.error("赞数、核验数及范围上限必须 >= 0，页数上限必须 >= 1")
     if args.personal_only and args.review_id:
         parser.error("--personal-only 不抓取读者观点，请移除此选项后使用 --review-id。")
     if args.liked_source == "links" and not args.review_id:

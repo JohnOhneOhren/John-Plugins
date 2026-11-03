@@ -130,12 +130,12 @@ def main(argv=None):
     prep.add_argument('--word-target', type=Path)
     prep.add_argument('--word-mode', choices=['existing', 'new'], help='Word 需先在对话中选择更新旧文件或在指定文件夹新建')
     prep.add_argument('--max-review-checks', type=int, default=0, help='0 核验全部已发现候选；正数为用户选择的限额')
-    prep.add_argument('--max-review-ranges', type=int, default=500)
+    prep.add_argument('--max-review-ranges', type=int, default=0, help='0 扫描全部已发现范围；正数限制范围并报告未完成')
     prep.add_argument('--max-review-pages', type=int, default=1000)
     prep.add_argument('--review-batch-size', type=int, default=5, help='同章范围合并查询数；1 关闭批量查询')
     prep.add_argument('--review-workers', type=int, default=6, help='有界并发核验数，1 到 8，默认 6')
     prep.add_argument('--review-id', action='append', default=[], help='优先核验用户提供的想法 ID 或详情链接')
-    prep.add_argument('--liked-source', choices=['paragraphs', 'links'], default='paragraphs')
+    prep.add_argument('--liked-source', choices=['highlights', 'paragraphs', 'links'], default='highlights')
     args = parser.parse_args(argv)
     try:
         with contextlib.redirect_stdout(sys.stderr):
@@ -204,8 +204,8 @@ def main(argv=None):
                     elif args.output.exists() and not args.output.is_dir():
                         raise incremental.SyncError('word_folder_required', '新建位置应是文件夹，而不是文件。')
                 if args.command == 'prepare':
-                    if args.max_review_checks < 0 or min(args.max_review_ranges, args.max_review_pages) < 1:
-                        raise core.ExportError('核验上限可为 0（核验全部候选），页数与范围上限必须大于 0。')
+                    if min(args.max_review_checks, args.max_review_ranges) < 0 or args.max_review_pages < 1:
+                        raise core.ExportError('核验和范围上限可为 0（处理全部已发现项），页数上限必须大于 0。')
                     for reference in args.review_id:
                         core.review_id_from_reference(reference)
                     if args.liked_source == 'links' and not args.review_id:
@@ -221,8 +221,8 @@ def main(argv=None):
                                          max_review_checks=getattr(args, 'max_review_checks', 0),
                                          max_pages=getattr(args, 'max_review_pages', 1000),
                                          review_ids=getattr(args, 'review_id', []),
-                                         liked_source=getattr(args, 'liked_source', 'paragraphs'),
-                                         max_review_ranges=getattr(args, 'max_review_ranges', 500),
+                                         liked_source=getattr(args, 'liked_source', 'highlights'),
+                                         max_review_ranges=getattr(args, 'max_review_ranges', 0),
                                          review_batch_size=getattr(args, 'review_batch_size', 5),
                                          review_workers=getattr(args, 'review_workers', 6))
                     shelf = client.shelf()
