@@ -368,6 +368,34 @@ class LikedThoughtTests(unittest.TestCase):
 
 
 class ConcurrentVerificationTests(unittest.TestCase):
+    def test_rejected_details_stop_scan_and_preserve_unchecked_count(self):
+        client = w.Weread(api_key='wrk-test', review_workers=1)
+        checked = []
+        def request(path, params=None, **kwargs):
+            if path == '/book/bestbookmarks':
+                return {'items': [{'range': '1-10'}]}
+            if path == '/book/underlines':
+                return {'underlines': []}
+            if path == '/book/readreviews':
+                return {'reviews': [{'range': '1-10', 'hasMore': 0, 'pageReviews': [
+                    {'reviewId': f'456_{i}'} for i in range(12)]}]}
+            checked.append(params['reviewId'])
+            raise w.RequestError('rejected', kind='http', code=403)
+        client.request = request
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(w.ExportError, 'http:403'):
+            client.liked_thoughts('b', [{'chapterUid': 1}], [], set())
+        self.assertEqual(len(checked), 1)
+        self.assertEqual(client.last_liked_scan['failure_reasons'], {'http:403': 1})
+        self.assertEqual(client.last_liked_scan['unchecked_candidates'], 11)
+        self.assertFalse(client.last_liked_scan['complete_within_known_ranges'])
+
+    def test_discovery_authorization_rejection_is_not_swallowed(self):
+        client = w.Weread(api_key='wrk-test')
+        client.request = Mock(side_effect=w.RequestError('rejected', kind='http', code=403))
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(w.RequestError):
+            client.liked_thoughts('b', [{'chapterUid': 1}, {'chapterUid': 2}], [], set())
+        client.request.assert_called_once()
+
     def test_concurrent_requests_keep_order_and_check_every_candidate(self):
         from threading import Barrier, Lock
         client = w.Weread(api_key='wrk-test', review_workers=3, liked_source='links',

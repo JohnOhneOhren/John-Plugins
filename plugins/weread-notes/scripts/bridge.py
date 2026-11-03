@@ -231,7 +231,22 @@ def main(argv=None):
                     else:
                         selected = select_for_chat(shelf, args.book_id, args.book_name)
                         client.show_dates = args.dates == 'show'
-                        book = client.collect(selected, ZoneInfo('Asia/Shanghai'), 0)
+                        try:
+                            book = client.collect(selected, ZoneInfo('Asia/Shanghai'), 0)
+                        except core.ExportError as exc:
+                            # 即使停止导出，也保留安全诊断；不写目标笔记或私人正文。
+                            report = dict(client.last_liked_scan)
+                            if not report:
+                                code = getattr(exc, 'code', None)
+                                kind = getattr(exc, 'kind', 'validation')
+                                reason = f'{kind}:{code}' if code is not None else kind
+                                report = {'scope': client.liked_source, 'failure_reasons': {reason: 1},
+                                          'stopped_reason': reason, 'full_book_complete': False}
+                            report['status'] = 'incomplete'
+                            folder = args.output or Path.cwd() / 'Weread_Notes_Output'
+                            folder.mkdir(parents=True, exist_ok=True)
+                            core.atomic_json(folder / (core.safe_filename(str(selected['bookId'])) + '.liked-scan.json'), report)
+                            raise
                 if args.command == 'prepare':
                     book.show_dates = args.dates == 'show'
                     args.output = args.output or Path.cwd() / 'Weread_Notes_Output'

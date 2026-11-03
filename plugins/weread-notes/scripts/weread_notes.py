@@ -38,6 +38,13 @@ class ExportError(Exception):
     """可安全展示给用户的错误（不要包含服务端正文和凭证）。"""
 
 
+class RequestError(ExportError):
+    """保留安全的错误类型/代码，供扫描报告使用，不保存服务端正文。"""
+    def __init__(self, message, *, kind, code=None):
+        super().__init__(message)
+        self.kind, self.code = kind, code
+
+
 def parse_cookie(value: str) -> tuple[str, str]:
     """规范化请求头粘贴内容，只报告字段名称，不回显凭证值。"""
     value = re.sub(r"^cookie\s*:\s*", "", value.strip(), flags=re.I)
@@ -432,14 +439,16 @@ class Weread:
                     print(f"  服务繁忙，{delay} 秒后重试…")
                     time.sleep(delay)
                     continue
-                if exc.code in (301, 302, 303, 307, 308, 401, 403):
-                    raise ExportError(f"{path} 登录或授权失败，请更新 Cookie / API Key。") from None
-                raise ExportError(f"{path} 请求失败（HTTP {exc.code}）。") from None
+                if exc.code in (401, 403):
+                    raise RequestError(f"{path} 请求被拒绝（HTTP {exc.code}）；请核对官方授权状态。"
+                                       "仅凭此状态不能确定是凭证失效、权限限制还是服务端拒绝。",
+                                       kind='http', code=exc.code) from None
+                raise RequestError(f"{path} 请求失败（HTTP {exc.code}）。", kind='http', code=exc.code) from None
             except (URLError, TimeoutError, ConnectionError):
                 if attempt < 3:  # 微信请求均为只读，含查询型 POST，可以安全重试
                     time.sleep(2 ** attempt)
                     continue
-                raise ExportError(f"{path} 网络连接失败，请检查网络后重试。") from None
+                raise RequestError(f"{path} 网络连接失败，请检查网络后重试。", kind='network') from None
             except (ValueError, UnicodeError):
                 raise ExportError(f"{path} 未返回有效 JSON，可能需要重新登录或接口已变化。") from None
             if not isinstance(data, dict):
@@ -463,7 +472,8 @@ class Weread:
                     continue
                 raise self._session_failure(path)
             if str(code) not in ("0", "None", ""):
-                raise ExportError(f"{path} 业务错误（代码 {number(code)}），请检查登录状态和接口支持情况。")
+                raise RequestError(f"{path} 业务错误（代码 {number(code)}），请检查登录状态和接口支持情况。",
+                                   kind='business', code=number(code))
             return data
         raise ExportError("请求重试次数耗尽。")
 
@@ -679,6 +689,15 @@ class Weread:
             raise ExportError("提供的想法链接数超过 --max-review-checks，请提高上限或分批验证。")
         ranges: dict[tuple[str, str], dict] = {}
         failed = 0
+        failure_reasons = defaultdict(int)
+        stopped_reason = None
+        def record_failure(exc):
+            kind = getattr(exc, 'kind', 'validation')
+            code = getattr(exc, 'code', None)
+            reason = f'{kind}:{code}' if code is not None else kind
+            failure_reasons[reason] += 1
+            if failure_reasons[reason] == 1:
+                print(f'  读取失败类别：{reason}。失败项不能视为未点赞。')
         page_count = 0
         range_requests = 0
         visited_ranges, completed_ranges = set(), set()
@@ -722,7 +741,10 @@ class Weread:
                     for item in data["items"]:
                         if isinstance(item, dict):
                             add_range({**item, "chapterUid": item.get("chapterUid", uid)})
-                except ExportError:
+                except ExportError as exc:
+                    record_failure(exc)
+                    if isinstance(exc, RequestError) and exc.code in (401, 403, 429):
+                        raise
                     failed += 1
                 try:
                     data = self.request('/book/underlines', {'bookId': bid, 'chapterUid': number(uid), 'synckey': 0}, agent=True)
@@ -731,7 +753,10 @@ class Weread:
                     for item in data['underlines']:
                         if isinstance(item, dict):
                             add_range({**item, 'chapterUid': uid})
-                except ExportError:
+                except ExportError as exc:
+                    record_failure(exc)
+                    if isinstance(exc, RequestError) and exc.code in (401, 403, 429):
+                        raise
                     failed += 1
             # 先让每章的各范围轮流获得名额，再让每个范围轮流翻页。
             chapter_ranges = defaultdict(deque)
@@ -783,7 +808,9 @@ class Weread:
                                         cached_pages[(uid, s, json.dumps(c, sort_keys=True))] = matches[0]
                                     else:
                                         batch_enabled = False
-                            except ExportError:
+                            except ExportError as exc:
+                                if isinstance(exc, RequestError) and exc.code in (401, 403, 429):
+                                    raise
                                 batch_enabled = False
                             if not batch_enabled:
                                 print('  批量段落查询不完整，已自动切换单条查询。')
@@ -827,7 +854,10 @@ class Weread:
                         if next_cursor == cursor or not rows:
                             raise ExportError("段落想法分页游标停滞。")
                         queue.append(((uid, span), context, next_cursor, seen))
-                except ExportError:
+                except ExportError as exc:
+                    record_failure(exc)
+                    if isinstance(exc, RequestError) and exc.code in (401, 403, 429):
+                        raise
                     failed += 1
             pending_pages = bool(queue)
             if pending_pages:
@@ -836,7 +866,7 @@ class Weread:
             if not candidates:
                 raise ExportError("链接模式需要至少一个 --review-id 想法链接或 ID。")
             warnings.append("读者观点仅核验本次提供的想法链接，未扫描全书其他点赞记录。")
-        result, unknown, unliked, verified = [], 0, 0, 0
+        result, unknown, unliked, verified, attempted = [], 0, 0, 0, 0
         ordered = sorted(candidates.items(), key=lambda item: priorities.get(item[0], 2))
         if self.max_review_checks and len(ordered) > self.max_review_checks:
             warnings.append(f"发现 {len(ordered)} 条候选想法，本次仅核验前 {self.max_review_checks} 条，仍可能遗漏；可提高 --max-review-checks。")
@@ -850,7 +880,8 @@ class Weread:
                     print(f"  指定想法 {rid} 未收录：个人笔记接口将其列为本人内容。")
                 continue
             if index % 50 == 0:
-                print(f"  正在核验点赞状态 {index + 1}/{len(selected)}，已用 {int(time.monotonic() - verify_started)} 秒…")
+                print(f"  正在核验点赞状态 {index + 1}/{len(selected)}，成功 {verified}，失败 {failed}，已用 {int(time.monotonic() - verify_started)} 秒…")
+            attempted += 1
             try:
                 data = fetch_detail()
                 row = unwrap_review_detail(data)
@@ -880,17 +911,20 @@ class Weread:
                         print(f"  指定想法 {rid} 已确认点赞，正在核对作者与导出条件。")
                 elif rid in explicit_ids:
                     print(f"  指定想法 {rid} 未收录：详情正文为空。")
-            except ExportError:
+            except ExportError as exc:
                 # 用户指定的样本失败时必须明确停止，不能静默跳过验证目标。
+                record_failure(exc)
                 if rid in explicit_ids:
                     raise
                 failed += 1
+                if isinstance(exc, RequestError) and (exc.code in (401, 403, 429) or exc.kind == 'network'):
+                    stopped_reason = f'{exc.kind}:{exc.code}' if exc.code is not None else exc.kind
+                    print('  接口持续不可用，已停止继续核验；剩余条目未完成，不表示没有点赞。')
+                    break
         if failed:
             warnings.append(f"{failed} 个章节、段落或想法未能读取，本次读者观点不完整。")
         if unknown:
             warnings.append(f"{unknown} 条想法没有可确认的点赞状态，未收录。")
-        if failed and not verified:
-            raise ExportError(f"读者想法扫描有 {failed} 处读取失败，未能核验任何候选想法，不能将此结果视为没有点赞记录。")
         print(f"  已核验 {verified} 条想法：已点赞 {len(result)} 条，未点赞 {unliked} 条，状态未知 {unknown} 条。")
         self.last_liked_scan = {'scope': self.liked_source, 'known_ranges': len(ranges),
                                'range_requests': range_requests, 'range_batch_size': self.review_batch_size,
@@ -899,15 +933,20 @@ class Weread:
                                'scheduled_ranges': scheduled_count, 'visited_ranges': len(visited_ranges),
                                'completed_ranges': len(completed_ranges), 'pages_read': page_count,
                                'discovered_candidates': len(candidates), 'selected_candidates': len(selected),
-                               'verified_candidates': verified, 'unchecked_candidates': len(ordered) - len(selected),
+                               'verified_candidates': verified, 'attempted_candidates': attempted,
+                               'unchecked_candidates': len(ordered) - attempted - sum(rid in own_ids for rid, _ in selected),
                                'confirmed_liked': len(result), 'unliked': unliked, 'unknown': unknown,
                                'failed_requests': failed, 'pending_pages': pending_pages,
+                               'failure_reasons': dict(failure_reasons), 'stopped_reason': stopped_reason,
                                'complete_within_known_ranges': self.liked_source == 'paragraphs' and
                                    len(completed_ranges) == len(ranges) and not failed and not unknown and
-                                   len(selected) == len(ordered),
+                                   len(selected) == len(ordered) and not stopped_reason,
                                'full_book_complete': False}
         print(f'  范围统计：读完 {len(completed_ranges)}/{len(ranges)} 个已知范围，'
               f'核验 {verified}/{len(candidates)} 条候选；这不是全书点赞清单。')
+        if stopped_reason or failed and not verified:
+            raise ExportError(f"读者想法核验未完成：成功 {verified} 条，读取失败 {failed} 处，"
+                              f"原因 {stopped_reason or '读取/校验失败'}。不能将此结果视为没有点赞记录。")
         return unique_rows(result, "reviewId"), list(dict.fromkeys(warnings))
 
     def highlights(self, bid: str, *, agent: bool = False) -> tuple[list[dict], dict]:

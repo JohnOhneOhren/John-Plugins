@@ -32,6 +32,25 @@ def run_bridge(arguments):
 
 
 class ChatFlowTests(unittest.TestCase):
+    def test_failed_collection_saves_diagnostic_without_exporting(self):
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(credentials, 'get_key', return_value='wrk-fixture'), \
+                patch.object(bridge.core, 'Weread') as factory, \
+                patch.object(bridge, 'connector_plan') as plan:
+            client = factory.return_value
+            client.shelf.return_value = BOOKS
+            client.last_liked_scan = {}
+            client.liked_source = 'paragraphs'
+            client.collect.side_effect = bridge.core.RequestError('blocked HTTP 403', kind='http', code=403)
+            code, result = run_bridge(['prepare', '--book-id', '1', '--format', 'notion',
+                                       '--dates', 'hide', '--output', folder])
+            self.assertNotEqual(code, 0)
+            report = json.loads((Path(folder) / '1.liked-scan.json').read_text(encoding='utf-8'))
+            self.assertEqual(report['failure_reasons'], {'http:403': 1})
+            self.assertEqual(report['status'], 'incomplete')
+            self.assertNotIn('wrk-fixture', json.dumps(report))
+            plan.assert_not_called()
+
     def test_retention_choice_required_before_key_is_read(self):
         class Unreadable:
             def readline(self, *args):
