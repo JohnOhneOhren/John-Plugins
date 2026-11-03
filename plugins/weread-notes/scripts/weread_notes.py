@@ -40,9 +40,42 @@ class ExportError(Exception):
 
 class RequestError(ExportError):
     """保留安全的错误类型/代码，供扫描报告使用，不保存服务端正文。"""
-    def __init__(self, message, *, kind, code=None):
+    def __init__(self, message, *, kind, code=None, diagnostic=None):
         super().__init__(message)
         self.kind, self.code = kind, code
+        self.diagnostic = diagnostic or {}
+
+    @property
+    def stops_scan(self):
+        return self.kind == 'network' or self.code in (401, 403, 429, 499, 500, 502, 503, 504)
+
+
+def http_error_diagnostic(exc):
+    """只留大小、结构、数值错误码和固定提示类别，不存原始响应/自由文本。"""
+    headers = exc.headers or {}
+    result = {'http_status': exc.code, 'retry_after_seconds': max(0, number(headers.get('Retry-After'), 0))}
+    media_type = str(headers.get('Content-Type', '')).split(';')[0].strip().lower()
+    result['media_type'] = media_type if media_type in ('application/json', 'text/html', 'text/plain') else 'other'
+    try:
+        raw = exc.read(8192)
+        result['body_bytes_sampled'] = len(raw)
+        payload = json.loads(raw.decode('utf-8'))
+        result['response_shape'] = response_shape(payload)
+        if isinstance(payload, dict):
+            for field in ('errcode', 'errCode', 'code'):
+                if re.fullmatch(r'-?\d{1,12}', str(payload.get(field, ''))):
+                    result['business_code'] = number(payload[field])
+                    break
+            message = ' '.join(str(payload.get(k, '')) for k in ('message', 'errmsg', 'error', 'msg'))
+            hints = {'rate_limit': r'too many|rate.?limit|频繁|限流',
+                     'permission': r'permission|unauthorized|forbidden|权限|无权|不可见',
+                     'not_found': r'not.?found|deleted|不存在|已删除',
+                     'invalid_parameter': r'invalid|parameter|参数|格式',
+                     'upgrade': r'upgrade|version|升级|版本', 'timeout': r'timeout|超时'}
+            result['hint_categories'] = [name for name, pattern in hints.items() if re.search(pattern, message, re.I)]
+    except (OSError, ValueError, UnicodeError, AttributeError):
+        result['response_format'] = 'empty_or_non_json'
+    return result
 
 
 def parse_cookie(value: str) -> tuple[str, str]:
@@ -327,7 +360,9 @@ class Weread:
         self._thread_transport = local()
         self._agent_interval = 0.2 if review_workers > 1 else 0.4
         self._cooldown_until = 0.0
+        self._halt_error = None
         self.last_liked_scan = {}
+        self.failed_review_ids = []  # 仅供本机定点复查；不进入计数报告或公开包。
         self.cookie_policy = DefaultCookiePolicy()
         self.cookiejar = CookieJar(policy=self.cookie_policy)
         self._seeded_cookies = {}
@@ -418,6 +453,9 @@ class Weread:
         for attempt in range(5):
             # 全体工作线程共享发起频率和服务端退避，不能各自突破限速。
             with self._request_lock:
+                if agent and self._halt_error is not None:
+                    raise RequestError('详情服务不可用，本轮已停止新请求。', kind='http',
+                                       code=self._halt_error.code, diagnostic=self._halt_error.diagnostic)
                 interval = self._agent_interval if agent else 0.4
                 time.sleep(max(0, self.last_request + interval - time.monotonic(),
                                self._cooldown_until - time.monotonic()))
@@ -435,6 +473,8 @@ class Weread:
                         self._accept_rotated_cookies(response, request)
                     data = json.loads(response.read().decode("utf-8"))
             except HTTPError as exc:
+                diagnostic = http_error_diagnostic(exc)
+                diagnostic['attempts'] = attempt + 1
                 if not agent:
                     self._accept_rotated_cookies(exc, request)
                 if exc.code == 401 and not agent and _recover_session:
@@ -444,20 +484,24 @@ class Weread:
                         session_retried = True
                         continue
                     raise self._session_failure(path, "HTTP 401") from None
-                if exc.code in (429, 500, 502, 503, 504) and attempt < 3:
+                if exc.code in (429, 499, 500, 502, 503, 504) and attempt < 3:
                     delay = max(2 ** attempt, number(exc.headers.get("Retry-After"), 0))
-                    if agent and exc.code == 429:
+                    if delay > 60:
+                        raise RequestError(f'{path} 返回 HTTP {exc.code}，服务端要求等待，已停止本轮查询。',
+                                           kind='http', code=exc.code, diagnostic=diagnostic) from None
+                    if agent and exc.code in (429, 499):
                         with self._request_lock:
                             self._agent_interval = min(2.0, self._agent_interval * 2)
                             self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
-                    print(f"  服务繁忙，{delay} 秒后重试…")
+                    print(f"  HTTP {exc.code}，{delay} 秒后有限重试（{attempt + 1}/3）…")
                     time.sleep(delay)
                     continue
                 if exc.code in (401, 403):
                     raise RequestError(f"{path} 请求被拒绝（HTTP {exc.code}）；请核对官方授权状态。"
                                        "仅凭此状态不能确定是凭证失效、权限限制还是服务端拒绝。",
-                                       kind='http', code=exc.code) from None
-                raise RequestError(f"{path} 请求失败（HTTP {exc.code}）。", kind='http', code=exc.code) from None
+                                       kind='http', code=exc.code, diagnostic=diagnostic) from None
+                raise RequestError(f"{path} 请求失败（HTTP {exc.code}），已尝试 {attempt + 1} 次。",
+                                   kind='http', code=exc.code, diagnostic=diagnostic) from None
             except (URLError, TimeoutError, ConnectionError):
                 if attempt < 3:  # 微信请求均为只读，含查询型 POST，可以安全重试
                     time.sleep(2 ** attempt)
@@ -661,8 +705,14 @@ class Weread:
             rid = item[0]
             if rid in own_ids:
                 return None
-            return seed_details[rid] if rid in seed_details else self.request(
-                '/review/single', {'reviewId': rid}, agent=True)
+            try:
+                return seed_details[rid] if rid in seed_details else self.request(
+                    '/review/single', {'reviewId': rid}, agent=True)
+            except RequestError as exc:
+                if exc.stops_scan:
+                    with self._request_lock:
+                        self._halt_error = exc
+                raise
         if self.review_workers == 1:
             for item in selected:
                 yield item, lambda item=item: fetch(item)
@@ -705,12 +755,15 @@ class Weread:
         ranges: dict[tuple[str, str], dict] = {}
         failed = 0
         failure_reasons = defaultdict(int)
+        failure_diagnostics = {}
         stopped_reason = None
         def record_failure(exc):
             kind = getattr(exc, 'kind', 'validation')
             code = getattr(exc, 'code', None)
             reason = f'{kind}:{code}' if code is not None else kind
             failure_reasons[reason] += 1
+            if getattr(exc, 'diagnostic', None):
+                failure_diagnostics.setdefault(reason, exc.diagnostic)
             if failure_reasons[reason] == 1:
                 print(f'  读取失败类别：{reason}。失败项不能视为未点赞。')
         page_count = 0
@@ -773,7 +826,7 @@ class Weread:
                             add_range({**item, "chapterUid": item.get("chapterUid", uid)}, overlap_only=highlight_scope)
                 except ExportError as exc:
                     record_failure(exc)
-                    if isinstance(exc, RequestError) and exc.code in (401, 403, 429):
+                    if isinstance(exc, RequestError) and exc.stops_scan:
                         raise
                     failed += 1
                 try:
@@ -787,7 +840,7 @@ class Weread:
                             add_range({**item, 'chapterUid': uid}, overlap_only=highlight_scope)
                 except ExportError as exc:
                     record_failure(exc)
-                    if isinstance(exc, RequestError) and exc.code in (401, 403, 429):
+                    if isinstance(exc, RequestError) and exc.stops_scan:
                         raise
                     failed += 1
             # 先让每章的各范围轮流获得名额，再让每个范围轮流翻页。
@@ -841,7 +894,7 @@ class Weread:
                                     else:
                                         batch_enabled = False
                             except ExportError as exc:
-                                if isinstance(exc, RequestError) and exc.code in (401, 403, 429):
+                                if isinstance(exc, RequestError) and exc.stops_scan:
                                     raise
                                 batch_enabled = False
                             if not batch_enabled:
@@ -892,7 +945,7 @@ class Weread:
                         queue.append(((uid, span), context, next_cursor, seen))
                 except ExportError as exc:
                     record_failure(exc)
-                    if isinstance(exc, RequestError) and exc.code in (401, 403, 429):
+                    if isinstance(exc, RequestError) and exc.stops_scan:
                         raise
                     failed += 1
             pending_pages = bool(queue)
@@ -956,10 +1009,12 @@ class Weread:
             except ExportError as exc:
                 # 用户指定的样本失败时必须明确停止，不能静默跳过验证目标。
                 record_failure(exc)
+                if rid not in self.failed_review_ids and len(self.failed_review_ids) < 3:
+                    self.failed_review_ids.append(rid)
                 if rid in explicit_ids:
                     raise
                 failed += 1
-                if isinstance(exc, RequestError) and (exc.code in (401, 403, 429) or exc.kind == 'network'):
+                if isinstance(exc, RequestError) and exc.stops_scan:
                     stopped_reason = f'{exc.kind}:{exc.code}' if exc.code is not None else exc.kind
                     print('  接口持续不可用，已停止继续核验；剩余条目未完成，不表示没有点赞。')
                     break
@@ -980,6 +1035,7 @@ class Weread:
                                'confirmed_liked': len(result), 'unliked': unliked, 'unknown': unknown,
                                'failed_requests': failed, 'pending_pages': pending_pages,
                                'failure_reasons': dict(failure_reasons), 'stopped_reason': stopped_reason,
+                               'failure_diagnostics': failure_diagnostics,
                                'highlight_count': len(highlights), 'invalid_highlight_locations': invalid_marks,
                                'highlight_chapters': len(marked_ranges), 'outside_highlights': outside_highlights,
                                'complete_within_known_ranges': self.liked_source in ('paragraphs', 'highlights') and

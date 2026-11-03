@@ -242,10 +242,18 @@ def main(argv=None):
                                 reason = f'{kind}:{code}' if code is not None else kind
                                 report = {'scope': client.liked_source, 'failure_reasons': {reason: 1},
                                           'stopped_reason': reason, 'full_book_complete': False}
+                                if getattr(exc, 'diagnostic', None):
+                                    report['failure_diagnostics'] = {reason: exc.diagnostic}
                             report['status'] = 'incomplete'
                             folder = args.output or Path.cwd() / 'Weread_Notes_Output'
                             folder.mkdir(parents=True, exist_ok=True)
                             core.atomic_json(folder / (core.safe_filename(str(selected['bookId'])) + '.liked-scan.json'), report)
+                            samples = getattr(client, 'failed_review_ids', [])
+                            if isinstance(samples, list) and samples:
+                                # 单独留少量失败 ID 用于本机定点复查，不把私人内容放入诊断摘要。
+                                samples = [rid for rid in samples[:3] if isinstance(rid, str)]
+                                core.atomic_json(folder / (core.safe_filename(str(selected['bookId'])) + '.review-retry.json'),
+                                                 {'book_id': str(selected['bookId']), 'review_ids': samples})
                             raise
                 if args.command == 'prepare':
                     book.show_dates = args.dates == 'show'

@@ -368,6 +368,77 @@ class LikedThoughtTests(unittest.TestCase):
 
 
 class ConcurrentVerificationTests(unittest.TestCase):
+    def test_persistent_499_stops_after_bounded_inflight_details(self):
+        client = w.Weread(api_key='wrk-fixture', review_workers=3)
+        checked = []
+        def request(path, params=None, **kwargs):
+            if path == '/book/bestbookmarks':
+                return {'items': [{'range': '1-10'}]}
+            if path == '/book/underlines':
+                return {'underlines': []}
+            if path == '/book/readreviews':
+                return {'reviews': [{'range': '1-10', 'hasMore': 0,
+                    'pageReviews': [{'reviewId': f'456_{i}'} for i in range(8)]}]}
+            checked.append(params['reviewId'])
+            raise w.RequestError('unavailable', kind='http', code=499,
+                                 diagnostic={'http_status': 499, 'attempts': 4})
+        client.request = request
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(w.ExportError):
+            client.liked_thoughts('b', [{'chapterUid': 1}], [], set())
+        self.assertLessEqual(len(checked), 3)
+        self.assertEqual(client.last_liked_scan['stopped_reason'], 'http:499')
+        self.assertEqual(client.failed_review_ids, ['456_0'])
+        self.assertEqual(client.last_liked_scan['unchecked_candidates'], 7)
+        self.assertEqual(client.last_liked_scan['failure_diagnostics']['http:499']['attempts'], 4)
+
+    def test_499_retries_then_recovers(self):
+        transport = ScriptedHTTPS([(499, {'error': 'temporary'}, None), (200, {'reviewId': '456_a'}, None)])
+        client = w.Weread(api_key='wrk-fixture')
+        client.agent_opener = w.build_opener(w.NoRedirect(), transport)
+        with patch.object(w.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
+            result = client.request('/review/single', {'reviewId': '456_a'}, agent=True)
+        self.assertEqual(result['reviewId'], '456_a')
+        self.assertEqual(len(transport.requests), 2)
+        self.assertGreater(client._agent_interval, 0.4)
+
+    def test_persistent_499_has_bounded_retries_and_private_safe_diagnostic(self):
+        payload = {'code': -123, 'message': 'invalid parameter wrk-private-secret private-comment',
+                   'token': 'never-output'}
+        transport = ScriptedHTTPS([(499, payload, None) for _ in range(4)])
+        client = w.Weread(api_key='wrk-fixture')
+        client.agent_opener = w.build_opener(w.NoRedirect(), transport)
+        with patch.object(w.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(w.RequestError) as caught:
+            client.request('/review/single', {'reviewId': '456_a'}, agent=True)
+        error = caught.exception
+        self.assertEqual(len(transport.requests), 4)
+        self.assertEqual(error.diagnostic['attempts'], 4)
+        self.assertEqual(error.diagnostic['business_code'], -123)
+        self.assertIn('invalid_parameter', error.diagnostic['hint_categories'])
+        self.assertTrue(error.stops_scan)
+        safe = w.json.dumps(error.diagnostic) + str(error)
+        for secret in ('wrk-private-secret', 'private-comment', 'never-output'):
+            self.assertNotIn(secret, safe)
+
+    def test_stopped_circuit_does_not_make_new_network_requests(self):
+        client = w.Weread(api_key='wrk-fixture')
+        client._halt_error = w.RequestError('unavailable', kind='http', code=499)
+        client.agent_opener = Mock()
+        with self.assertRaises(w.RequestError):
+            client.request('/review/single', {'reviewId': '456_a'}, agent=True)
+        client.agent_opener.open.assert_not_called()
+
+    def test_server_long_wait_stops_without_sleeping_for_minutes(self):
+        from email.message import Message
+        client = w.Weread(api_key='wrk-fixture')
+        headers = Message()
+        headers['Retry-After'] = '3600'
+        client.agent_opener = Mock()
+        client.agent_opener.open.side_effect = w.HTTPError('https://weread.qq.com', 499, 'busy', headers, io.BytesIO(b'{}'))
+        with patch.object(w.time, 'sleep') as sleep, self.assertRaises(w.RequestError):
+            client.request('/review/single', {'reviewId': '456_a'}, agent=True)
+        self.assertEqual(client.agent_opener.open.call_count, 1)
+        self.assertTrue(all(call.args[0] < 60 for call in sleep.call_args_list))
+
     def test_rejected_details_stop_scan_and_preserve_unchecked_count(self):
         client = w.Weread(api_key='wrk-test', review_workers=1)
         checked = []
